@@ -25,7 +25,7 @@ struct window_event {
     /* These fields could be uint8 and int16, but we want this file to be
        simple. */
     union {
-        unsigned char key;
+        unsigned int key;
         unsigned char button;
     };
     short x;
@@ -112,10 +112,10 @@ void flush_window(struct window *win);
 void window_update_input_state(struct window *win, struct window_event *event) {
     switch (event->type) {
     case WINDOW_KEY_DOWN:
-        win->key_down[event->key] = true;
+        if (event->key < 256) win->key_down[event->key] = true;
         break;
     case WINDOW_KEY_UP:
-        win->key_down[event->key] = false;
+        if (event->key < 256) win->key_down[event->key] = false;
         break;
     case WINDOW_BUTTON_DOWN:
         if (event->button < 7) win->button_down[event->button] = true;
@@ -651,26 +651,16 @@ bool get_event(struct window *win, struct window_event *event_out, bool block) {
             win->waiting_for_shm_completion = false;
         } else if (xevent.type == KeyPress) {
             KeySym key;
-            char text[64];
+            XLookupString(&xevent.xkey, NULL, 0, &key, 0);
 
-            if (XLookupString(&xevent.xkey, text, 64, &key, 0) == 1) {
-                unsigned char c = text[0];
-                if (c >= 'A' && c <= 'Z') c = 'a' + (c - 'A');
-
-                event.type = WINDOW_KEY_DOWN;
-                event.key = c;
-            }
+            event.type = WINDOW_KEY_DOWN;
+            event.key = key;
         } else if (xevent.type == KeyRelease) {
             KeySym key;
-            char text[64];
+            XLookupString(&xevent.xkey, NULL, 0, &key, 0);
 
-            if (XLookupString(&xevent.xkey, text, 64, &key, 0) == 1) {
-                unsigned char c = text[0];
-                if (c >= 'A' && c <= 'Z') c = 'a' + (c - 'A');
-
-                event.type = WINDOW_KEY_UP;
-                event.key = c;
-            }
+            event.type = WINDOW_KEY_UP;
+            event.key = key;
         } else if (xevent.type == ButtonPress) {
             event.type = WINDOW_BUTTON_DOWN;
             event.key = xevent.xbutton.button;
