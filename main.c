@@ -61,11 +61,6 @@ int entrypoint(int argc, char **argv) {
 
     struct text_state text = {0};
     arrpush(text.lines, NULL);
-    arrpush(text.lines[0], 'h');
-    arrpush(text.lines[0], 'i');
-    arrpush(text.lines, NULL);
-    arrpush(text.lines[1], ':');
-    arrpush(text.lines[1], ')');
 
     long frame = 0;
     while (true) {
@@ -146,19 +141,26 @@ int entrypoint(int argc, char **argv) {
                 }
                 /* enter */
                 if (event.key == 65293) {
-                    char_buffer sel = text.lines[text.cursor_row];
-                    char *rest_data = &sel[text.cursor_column];
-                    int rest_len = arrlen(sel) - text.cursor_column;
+                    if (event.mask & WINDOW_MASK_SHIFT) {
+                        char_buffer sel = text.lines[text.cursor_row];
+                        char *rest_data = &sel[text.cursor_column];
+                        int rest_len = arrlen(sel) - text.cursor_column;
 
-                    char_buffer new_line = NULL;
-                    char *spot = arraddnptr(new_line, rest_len);
-                    memcpy(spot, rest_data, rest_len);
-                    arrsetlen(sel, text.cursor_column);
+                        char_buffer new_line = NULL;
+                        char *spot = arraddnptr(new_line, rest_len);
+                        memcpy(spot, rest_data, rest_len);
+                        arrsetlen(sel, text.cursor_column);
 
-                    arrins(text.lines, text.cursor_row + 1, new_line);
-                    text.cursor_row += 1;
-                    text.cursor_column = 0;
-                    text.cursor_blink_frame = frame;
+                        arrins(text.lines, text.cursor_row + 1, new_line);
+                        text.cursor_row += 1;
+                        text.cursor_column = 0;
+                        text.cursor_blink_frame = frame;
+                    } else {
+                        arrpush(text.lines, NULL);
+                        text.cursor_row = arrlen(text.lines) - 1;
+                        text.cursor_column = 0;
+                        text.cursor_blink_frame = frame;
+                    }
                 }
 
                 if (event.key >= 32 && event.key <= 127) {
@@ -167,7 +169,6 @@ int entrypoint(int argc, char **argv) {
                     text.cursor_column += 1;
                     text.cursor_blink_frame = frame;
                 }
-                //printf("key: %d\n", event.key);
             }
             continue;
         }

@@ -20,6 +20,12 @@ enum window_event_type {
     WINDOW_CLOSE,
 };
 
+enum window_keyboard_mask {
+    WINDOW_MASK_NONE = 0x0,
+    WINDOW_MASK_SHIFT = 0x1,
+    WINDOW_MASK_CONTROL = 0x2,
+};
+
 struct window_event {
     enum window_event_type type;
     /* These fields could be uint8 and int16, but we want this file to be
@@ -28,6 +34,7 @@ struct window_event {
         unsigned int key;
         unsigned char button;
     };
+    enum window_keyboard_mask mask;
     short x;
     short y;
 };
@@ -655,6 +662,14 @@ bool get_event(struct window *win, struct window_event *event_out, bool block) {
 
             event.type = WINDOW_KEY_DOWN;
             event.key = key;
+
+            event.mask = WINDOW_MASK_NONE;
+            if (xevent.xkey.state & ShiftMask) {
+                event.mask |= WINDOW_MASK_SHIFT;
+            }
+            if (xevent.xkey.state & ControlMask) {
+                event.mask |= WINDOW_MASK_CONTROL;
+            }
         } else if (xevent.type == KeyRelease) {
             KeySym key;
             XLookupString(&xevent.xkey, NULL, 0, &key, 0);
