@@ -3,29 +3,69 @@
 -export([start/0]).
 -export([prompt_worker/1]).
 
--record(cs, {socket, servers = []}).
+-type input_mode() :: normal
+                      | {connect, inet:ip_address(), inet:port_number(), reference()}
+                      | {login, inet:ip_address(), inet:port_number()}.
+
+-record(cs, {socket, servers = [], input_mode = normal :: input_mode()}).
 
 start() ->
     io:format("Interchat client started. Enter '/help' for a list of commands.~n", []),
     {ok, Socket} = gen_udp:open(0),
-    spawn(?MODULE, prompt_worker, [self()]),
-    loop(#cs{socket = Socket}).
+    prompt_and_loop(#cs{socket = Socket}).
 
 prompt_worker(PID) ->
     Str = prompt(),
     PID ! {user_input, Str},
     ok.
 
-loop(State) ->
+prompt_and_loop(State) ->
+    maybe_spawn_prompt(State),
+    loop(State).
+
+loop(State = #cs{socket = Socket}) ->
     receive
         {user_input, Str} ->
-            NewState = parse(State, Str),
-            spawn(?MODULE, prompt_worker, [self()]),
-            loop(NewState);
+            NewState = dispatch_input(State, Str),
+            prompt_and_loop(NewState);
+        {udp, Socket, IP, Port, "connection accepted"} ->
+            case State#cs.input_mode of
+                {connect, IP, Port, TRef} ->
+                    erlang:cancel_timer(TRef),
+                    io:format("Server found. What is your username?~n", []),
+                    NewState = State#cs{input_mode = {login, IP, Port}},
+                    prompt_and_loop(NewState);
+                _ ->
+                    loop(State)
+            end;
+        {timeout, TRef, {connect, IP, Port}} ->
+            case State#cs.input_mode of
+                {connect, IP, Port, TRef} ->
+                    io:format("Connection timed out.~n", []),
+                    prompt_and_loop(State#cs{input_mode = normal});
+                _ ->
+                    loop(State)
+            end;
         Message ->
             io:format("Client loop got unknown message:~n~p~n", [Message]),
             loop(State)
     end.
+
+dispatch_input(State = #cs{input_mode = normal}, Str) ->
+    parse(State, Str);
+dispatch_input(State = #cs{input_mode = {login, IP, Port}}, Str) ->
+    reply_login(State, IP, Port, Str);
+dispatch_input(State = #cs{input_mode = Mode}, _) ->
+    io:format("Got unexpected input from prompt worker?~n", []),
+    io:format("Mode is ~p.~n", [Mode]),
+    State.
+
+maybe_spawn_prompt(#cs{input_mode = normal}) ->
+    spawn(?MODULE, prompt_worker, [self()]);
+maybe_spawn_prompt(#cs{input_mode = {login, _, _}}) ->
+    spawn(?MODULE, prompt_worker, [self()]);
+maybe_spawn_prompt(#cs{input_mode = _}) ->
+    ok.
 
 parse(State, Str) ->
     case word(Str) of
@@ -48,6 +88,22 @@ parse(State, Str) ->
             State;
         {_, _} ->
             io:format("No conversation has been selected.~n", []),
+            State
+    end.
+
+reply_login(State, IP, Port, Str) ->
+    case word(Str) of
+        {[$/ | _], ""} ->
+            % FIXME: Usernames need to be a much more specific range of
+            % characters than that!
+            io:format("Usernames cannot begin with a slash.~n", []),
+            State;
+        {Username, ""} ->
+            io:format("Hello ~s.~n", [Username]),
+            Servers = [{IP, Port, Username} | State#cs.servers],
+            State#cs{servers = Servers, input_mode = normal};
+        {_, _} ->
+            io:format("Usernames must be a single word.~n", []),
             State
     end.
 
@@ -85,21 +141,10 @@ connect(State = #cs{socket = Socket}, Host, Port) ->
     case gen_udp:send(Socket, Host, Port, "interchat connect") of
         ok ->
             {ok, IP} = inet:getaddr(Host, inet),
-            await_connect(State, IP, Port);
+            TRef = erlang:start_timer(5000, self(), {connect, IP, Port}),
+            State#cs{input_mode = {connect, IP, Port, TRef}};
         {error, Reason} ->
             io:format("Error: ~p~n", [Reason]),
-            State
-    end.
-
-await_connect(State = #cs{socket = Socket}, IP, Port) ->
-    receive
-        {udp, Socket, IP, Port, "connection accepted"} ->
-            io:format("Connection successful.~n", []),
-            Servers = [{IP, Port} | State#cs.servers],
-            State#cs{servers = Servers}
-    after
-        5000 ->
-            io:format("Connection timed out.~n", []),
             State
     end.
 
