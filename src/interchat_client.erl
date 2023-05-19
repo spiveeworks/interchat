@@ -4,8 +4,12 @@
 -export([prompt_worker/1]).
 
 -type input_mode() :: normal
-                      | {connect, inet:ip_address(), inet:port_number(), reference()}
-                      | {login, inet:ip_address(), inet:port_number()}.
+                      | {connect, inet:ip_address(), inet:port_number(),
+                         reference()}
+                      | {username, inet:ip_address(), inet:port_number()}
+                      | {send_username, inet:ip_address(), inet:port_number(),
+                         string(), reference()}.
+
 
 -record(cs, {socket, servers = [], input_mode = normal :: input_mode()}).
 
@@ -23,24 +27,64 @@ prompt_and_loop(State) ->
     maybe_spawn_prompt(State),
     loop(State).
 
-loop(State = #cs{socket = Socket}) ->
+loop(State = #cs{socket = Socket, input_mode = InputMode}) ->
     receive
         {user_input, Str} ->
             NewState = dispatch_input(State, Str),
             prompt_and_loop(NewState);
         {udp, Socket, IP, Port, "connection accepted"} ->
-            case State#cs.input_mode of
+            case InputMode of
                 {connect, IP, Port, TRef} ->
                     erlang:cancel_timer(TRef),
                     io:format("Server found. What is your username?~n", []),
-                    NewState = State#cs{input_mode = {login, IP, Port}},
+                    NewState = State#cs{input_mode = {username, IP, Port}},
+                    prompt_and_loop(NewState);
+                _ ->
+                    loop(State)
+            end;
+        {udp, Socket, IP, Port, "already connected"} ->
+            case InputMode of
+                {connect, IP, Port, TRef} ->
+                    erlang:cancel_timer(TRef),
+                    io:format("The server says you are already connected to it.~n", []),
+                    NewState = State#cs{input_mode = normal},
+                    prompt_and_loop(NewState);
+                _ ->
+                    loop(State)
+            end;
+        {udp, Socket, IP, Port, "username accepted: " ++ Username} ->
+            case InputMode of
+                {send_username, IP, Port, Username, TRef} ->
+                    erlang:cancel_timer(TRef),
+                    io:format("Login successful.~n", []),
+                    Servers = [{IP, Port, Username} | State#cs.servers],
+                    NewState = State#cs{servers = Servers, input_mode = normal},
+                    prompt_and_loop(NewState);
+                _ ->
+                    io:format("Late login success? Ignoring.~n", []),
+                    loop(State)
+            end;
+        {udp, Socket, IP, Port, "username taken: " ++ Username} ->
+            case InputMode of
+                {send_username, IP, Port, Username, TRef} ->
+                    erlang:cancel_timer(TRef),
+                    io:format("Username taken. Try again.~n", []),
+                    NewState = State#cs{input_mode = {username, IP, Port}},
                     prompt_and_loop(NewState);
                 _ ->
                     loop(State)
             end;
         {timeout, TRef, {connect, IP, Port}} ->
-            case State#cs.input_mode of
+            case InputMode of
                 {connect, IP, Port, TRef} ->
+                    io:format("Connection timed out.~n", []),
+                    prompt_and_loop(State#cs{input_mode = normal});
+                _ ->
+                    loop(State)
+            end;
+        {timeout, TRef, {send_username, IP, Port, Username}} ->
+            case InputMode of
+                {send_username, IP, Port, Username, TRef} ->
                     io:format("Connection timed out.~n", []),
                     prompt_and_loop(State#cs{input_mode = normal});
                 _ ->
@@ -53,7 +97,7 @@ loop(State = #cs{socket = Socket}) ->
 
 dispatch_input(State = #cs{input_mode = normal}, Str) ->
     parse(State, Str);
-dispatch_input(State = #cs{input_mode = {login, IP, Port}}, Str) ->
+dispatch_input(State = #cs{input_mode = {username, IP, Port}}, Str) ->
     reply_login(State, IP, Port, Str);
 dispatch_input(State = #cs{input_mode = Mode}, _) ->
     io:format("Got unexpected input from prompt worker?~n", []),
@@ -62,7 +106,7 @@ dispatch_input(State = #cs{input_mode = Mode}, _) ->
 
 maybe_spawn_prompt(#cs{input_mode = normal}) ->
     spawn(?MODULE, prompt_worker, [self()]);
-maybe_spawn_prompt(#cs{input_mode = {login, _, _}}) ->
+maybe_spawn_prompt(#cs{input_mode = {username, _, _}}) ->
     spawn(?MODULE, prompt_worker, [self()]);
 maybe_spawn_prompt(#cs{input_mode = _}) ->
     ok.
@@ -91,7 +135,7 @@ parse(State, Str) ->
             State
     end.
 
-reply_login(State, IP, Port, Str) ->
+reply_login(State = #cs{socket = Socket}, IP, Port, Str) ->
     case word(Str) of
         {[$/ | _], ""} ->
             % FIXME: Usernames need to be a much more specific range of
@@ -99,9 +143,14 @@ reply_login(State, IP, Port, Str) ->
             io:format("Usernames cannot begin with a slash.~n", []),
             State;
         {Username, ""} ->
-            io:format("Hello ~s.~n", [Username]),
-            Servers = [{IP, Port, Username} | State#cs.servers],
-            State#cs{servers = Servers, input_mode = normal};
+            case gen_udp:send(Socket, IP, Port, "username: " ++ Username) of
+                ok ->
+                    TRef = erlang:start_timer(5000, self(), {send_username, IP, Port, Username}),
+                    State#cs{input_mode = {send_username, IP, Port, Username, TRef}};
+                {error, Reason} ->
+                    io:format("Error: ~p~n", [Reason]),
+                    State
+            end;
         {_, _} ->
             io:format("Usernames must be a single word.~n", []),
             State
