@@ -1,37 +1,54 @@
 -module(interchat_client).
 
 -export([start/0]).
+-export([prompt_worker/1]).
 
--record(cs, {socket}).
+-record(cs, {socket, servers = []}).
 
 start() ->
     io:format("Interchat client started. Enter '/help' for a list of commands.~n", []),
     {ok, Socket} = gen_udp:open(0),
+    spawn(?MODULE, prompt_worker, [self()]),
     loop(#cs{socket = Socket}).
 
-loop(State) ->
+prompt_worker(PID) ->
     Str = prompt(),
+    PID ! {user_input, Str},
+    ok.
+
+loop(State) ->
+    receive
+        {user_input, Str} ->
+            NewState = parse(State, Str),
+            spawn(?MODULE, prompt_worker, [self()]),
+            loop(NewState);
+        Message ->
+            io:format("Client loop got unknown message:~n~p~n", [Message]),
+            loop(State)
+    end.
+
+parse(State, Str) ->
     case word(Str) of
         {"/help", Rest} ->
             help(Rest),
-            loop(State);
+            State;
         {"/quit", ""} ->
             stop_fast();
         {"/quit", _} ->
             io:format("/quit does not take any arguments~n", []),
-            loop(State);
+            State;
         {"/connect", ""} ->
             io:format("Please specify a server to connect to.~n", []),
             loop(State);
         {"/connect", A} ->
             NewState = connect(State, A),
-            loop(NewState);
+            NewState;
         {[$/ | A] , _} ->
             io:format("Unknown command '/~s'.~n", [A]),
-            loop(State);
+            State;
         {_, _} ->
             io:format("No conversation has been selected.~n", []),
-            loop(State)
+            State
     end.
 
 prompt() ->
@@ -65,11 +82,26 @@ connect(State, A) ->
     end.
 
 connect(State = #cs{socket = Socket}, Host, Port) ->
-    case gen_udp:send(Socket, Host, Port, "hi") of
-        ok -> ok;
-        {error, Reason} -> io:format("Error: ~p~n", [Reason])
-    end,
-    State.
+    case gen_udp:send(Socket, Host, Port, "interchat connect") of
+        ok ->
+            {ok, IP} = inet:getaddr(Host, inet),
+            await_connect(State, IP, Port);
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            State
+    end.
+
+await_connect(State = #cs{socket = Socket}, IP, Port) ->
+    receive
+        {udp, Socket, IP, Port, "connection accepted"} ->
+            io:format("Connection successful.~n", []),
+            Servers = [{IP, Port} | State#cs.servers],
+            State#cs{servers = Servers}
+    after
+        5000 ->
+            io:format("Connection timed out.~n", []),
+            State
+    end.
 
 help(_) ->
     io:format("/help - display this help message.~n", []),
