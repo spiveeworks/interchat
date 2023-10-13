@@ -44,6 +44,10 @@ loop(State = #ss{socket = Socket}) ->
             NewState = join_channel(State, IP, Port, ChannelName),
             inet:setopts(Socket, [{active, once}]),
             loop(NewState);
+        {udp, Socket, IP, Port, "message in " ++ Rest} ->
+            NewState = add_message(State, IP, Port, Rest),
+            inet:setopts(Socket, [{active, once}]),
+            loop(NewState);
         {udp, Socket, IP, Port, Datagram} ->
             io:format("~s:~w sent unexpected message ~s.~n", [inet:ntoa(IP), Port, Datagram]),
             inet:setopts(Socket, [{active, once}]),
@@ -127,25 +131,92 @@ join_channel2(State, IP, Port, Username, ChannelName) ->
         true ->
             case gen_udp:send(State#ss.socket, IP, Port, "already in channel: " ++ ChannelName) of
                 ok ->
-                    State;
+                    ok;
                 {error, Reason} ->
-                    io:format("Redundant join reply failed with reason ~p.~n", [Reason]),
-                    State
-            end;
+                    io:format("Redundant join reply failed with reason ~p.~n", [Reason])
+            end,
+            State;
         false ->
+            io:format("User ~s joined channel ~s.~n", [Username, ChannelName]),
+
+            Users = [Username | Channel#channel.users],
+
+            case gen_udp:send(State#ss.socket, IP, Port, "joined channel: " ++ ChannelName) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    io:format("Join reply failed with reason ~p.~n", [Reason])
+            end,
+
             NewMessage = #message{sender = server,
                                   remaining_users = Channel#channel.users,
                                   timestamp_ms = os:system_time(millisecond),
                                   message = Username ++ " joined."},
-            Users = [Username | Channel#channel.users],
             Messages = Channel#channel.mailbox ++ [NewMessage],
             NewChannelState = Channel#channel{users = Users, mailbox = Messages},
 
             NewChannels = maps:put(ChannelName, NewChannelState, State#ss.channels),
             NewState = State#ss{channels = NewChannels},
-            io:format("User ~s joined channel ~s.~n", [Username, ChannelName]),
+
             update_channel(NewState, ChannelName)
     end.
+
+add_message(State, IP, Port, Rest) ->
+    case string:split(Rest, ": ") of
+        [_, ""] ->
+            State;
+        ["", _] ->
+            State;
+        [ChannelName, Message] ->
+            add_message2(State, IP, Port, ChannelName, Message);
+        _ ->
+            State
+    end.
+
+add_message2(State, IP, Port, ChannelName, Message) ->
+    case maps:find(ChannelName, State#ss.channels) of
+        {ok, Channel} ->
+            add_message3(State, IP, Port, ChannelName, Message, Channel);
+        error ->
+            State
+    end.
+
+add_message3(State, IP, Port, ChannelName, Message, Channel) ->
+    % TODO: reply with error messages? Or assume they are malicious and ignore?
+    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
+        {{IP, Port}, not_chosen} ->
+            State;
+        {{IP, Port}, Username} ->
+            add_message4(State, IP, Port, Username, ChannelName, Message, Channel);
+        false ->
+            State
+    end.
+
+add_message4(State, IP, Port, Username, ChannelName, Message, Channel) ->
+    case lists:member(Username, Channel#channel.users) of
+        true ->
+            case gen_udp:send(State#ss.socket, IP, Port, "message received") of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    io:format("Message reply failed with reason ~p.~n", [Reason])
+            end,
+
+            NewMessage = #message{sender = Username,
+                                  remaining_users = lists:delete(Username, Channel#channel.users),
+                                  timestamp_ms = os:system_time(millisecond),
+                                  message = Message},
+            Messages = Channel#channel.mailbox ++ [NewMessage],
+            NewChannelState = Channel#channel{mailbox = Messages},
+
+            NewChannels = maps:put(ChannelName, NewChannelState, State#ss.channels),
+            NewState = State#ss{channels = NewChannels},
+
+            update_channel(NewState, ChannelName);
+        false ->
+            State
+    end.
+
 
 update_channel(State, ChannelName) ->
     case maps:find(ChannelName, State#ss.channels) of

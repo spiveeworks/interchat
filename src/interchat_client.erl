@@ -11,7 +11,8 @@
                          string(), reference()}.
 
 
--record(cs, {socket, servers = [], input_mode = normal :: input_mode()}).
+-record(cs, {socket, servers = [], input_mode = normal :: input_mode(),
+             current_channel = none :: none | {inet:ip_address(), inet:port_number(), string()}}).
 
 start() ->
     io:format("Interchat client started. Enter '/help' for a list of commands.~n", []),
@@ -94,7 +95,7 @@ loop(State = #cs{socket = Socket, input_mode = InputMode}) ->
                     loop(State)
             end;
         Message ->
-            io:format("Client loop got unknown message:~n~p~n", [Message]),
+            io:format("\rClient loop got unknown message:~n~p~n", [Message]),
             loop(State)
     end.
 
@@ -139,9 +140,22 @@ parse(State, Str) ->
         {[$/ | A] , _} ->
             io:format("Unknown command '/~s'.~n", [A]),
             State;
-        {_, _} ->
-            io:format("No conversation has been selected.~n", []),
-            State
+        _ ->
+            % Not a command, just send it as a chat message.
+            case State#cs.current_channel of
+                none ->
+                    io:format("No channel has been selected.~n", []),
+                    State;
+                {IP, Port, Channel} ->
+                    Datagram = "message in " ++ Channel ++ ": " ++ Str,
+                    case gen_udp:send(State#cs.socket, IP, Port, Datagram) of
+                        ok ->
+                            ok;
+                        {error, Reason} ->
+                            io:format("Error: ~p~n", [Reason])
+                    end,
+                    State
+            end
     end.
 
 reply_login(State = #cs{socket = Socket}, IP, Port, Str) ->
@@ -210,7 +224,9 @@ join(State = #cs{servers = [{IP, Port, _}]}, Channel) ->
     case gen_udp:send(State#cs.socket, IP, Port, "join " ++ Channel) of
         ok ->
             io:format("Attempting to join...~n", []),
-            State;
+            % TODO: wait for a response or timeout, rather than posting a
+            % prompt ">" prematurely?
+            State#cs{current_channel = {IP, Port, Channel}};
         {error, Reason} ->
             io:format("Error: ~p~n", [Reason]),
             State
@@ -243,6 +259,7 @@ display_message(State, IP, Port, Rest) ->
 
 display_message2(_State, _IP, _Port, Sender, TS, Payload) ->
     {_, {H, M, S}} = calendar:system_time_to_local_time(TS, millisecond),
+    % include a carriage return, to overwrite the prompt symbol.
     io:format("\r[~p:~p:~p] ~s: ~s~n", [H, M, S, Sender, Payload]),
     ok.
 
