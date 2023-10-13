@@ -74,6 +74,9 @@ loop(State = #cs{socket = Socket, input_mode = InputMode}) ->
                 _ ->
                     loop(State)
             end;
+        {udp, Socket, IP, Port, "message from " ++ Rest} ->
+            display_message(State, IP, Port, Rest),
+            loop(State);
         {timeout, TRef, {connect, IP, Port}} ->
             case InputMode of
                 {connect, IP, Port, TRef} ->
@@ -123,9 +126,15 @@ parse(State, Str) ->
             State;
         {"/connect", ""} ->
             io:format("Please specify a server to connect to.~n", []),
-            loop(State);
+            State;
         {"/connect", A} ->
             NewState = connect(State, A),
+            NewState;
+        {"/join", ""} ->
+            io:format("Please specify a channel to join.~n", []),
+            State;
+        {"/join", A} ->
+            NewState = join(State, A),
             NewState;
         {[$/ | A] , _} ->
             io:format("Unknown command '/~s'.~n", [A]),
@@ -197,9 +206,44 @@ connect(State = #cs{socket = Socket}, Host, Port) ->
             State
     end.
 
+join(State = #cs{servers = [{IP, Port, _}]}, Channel) ->
+    case gen_udp:send(State#cs.socket, IP, Port, "join " ++ Channel) of
+        ok ->
+            io:format("Attempting to join...~n", []),
+            State;
+        {error, Reason} ->
+            io:format("Error: ~p~n", [Reason]),
+            State
+    end;
+join(State = #cs{servers = []}, _) ->
+    io:format("Error: Use /connect to connect to a server first.~n"),
+    State;
+join(State, _) ->
+    io:format("Error: Multi-login not yet implemented.~n"),
+    State.
+
+
 help(_) ->
     io:format("/help - display this help message.~n", []),
     io:format("/quit - close the client.~n", []),
+    ok.
+
+display_message(State, IP, Port, Rest) ->
+    case string:split(Rest, ", ts: ") of
+        [Sender, Rest2] ->
+            case string:to_integer(Rest2) of
+                {TS, ", payload: " ++ Payload} ->
+                    display_message2(State, IP, Port, Sender, TS, Payload);
+                {_, _} ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+display_message2(_State, _IP, _Port, Sender, TS, Payload) ->
+    {_, {H, M, S}} = calendar:system_time_to_local_time(TS, millisecond),
+    io:format("\r[~p:~p:~p] ~s: ~s~n", [H, M, S, Sender, Payload]),
     ok.
 
 stop_fast() ->
