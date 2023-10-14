@@ -9,16 +9,17 @@
 
 -record(channel, {users = [] :: [string()], mailbox = []}).
 
--record(ss, {socket :: gen_udp:socket(),
+-record(ss, {msp_proc :: pid(),
              connections = [],
              channels = #{} :: #{string() => #channel{}},
              lobby = 0 :: integer()}).
 
 start() ->
     register(?MODULE, self()),
+    {ok, MSP} = msp:start_link(7777),
+    msp:start_listening(MSP, self(), self()),
     io:format("Server started.~n", []),
-    {ok, Socket} = gen_udp:open(7777, [{active, once}]),
-    loop(#ss{socket = Socket}).
+    loop(#ss{msp_proc = MSP}).
 
 state() ->
     ?MODULE ! {get_state, self()},
@@ -27,18 +28,20 @@ state() ->
             State
     end.
 
-loop(State = #ss{socket = Socket}) ->
+loop(State) ->
     receive
         {get_state, PID} ->
             PID ! {interchat_server_state, State},
             loop(State);
         {udp, Socket, IP, Port, "interchat connect"} ->
-            NewState = accept(State, IP, Port),
-            inet:setopts(Socket, [{active, once}]),
+            %NewState = accept(State, IP, Port),
+            NewState = State,
+            %inet:setopts(Socket, [{active, once}]),
             loop(NewState);
         {udp, Socket, IP, Port, "username: " ++ Username} ->
-            NewState = check_username_chosen(State, IP, Port, Username),
-            inet:setopts(Socket, [{active, once}]),
+            %NewState = check_username_chosen(State, IP, Port, Username),
+            NewState = State,
+            %inet:setopts(Socket, [{active, once}]),
             loop(NewState);
         {udp, Socket, IP, Port, "join " ++ ChannelName} ->
             NewState = join_channel(State, IP, Port, ChannelName),
@@ -52,11 +55,17 @@ loop(State = #ss{socket = Socket}) ->
             io:format("~s:~w sent unexpected message ~s.~n", [inet:ntoa(IP), Port, Datagram]),
             inet:setopts(Socket, [{active, once}]),
             loop(State);
+        {msp_connect, IP, Port} ->
+            % Log, but don't do anything until we get a username, since the msp
+            % process is already tracking the connection itself for us.
+            io:format("~s:~w connected.~n", [inet:ntoa(IP), Port]),
+            loop(State);
         Message ->
             io:format("Got unknown message: ~p~n", [Message]),
             loop(State)
     end.
 
+-ifdef(comment_out).
 accept(State, IP, Port) ->
     Connections = State#ss.connections,
     Socket = State#ss.socket,
@@ -113,6 +122,7 @@ check_username_chosen(State, IP, Port, Username) ->
         false ->
             State
     end.
+-endif.
 
 join_channel(State, IP, Port, ChannelName) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
@@ -129,7 +139,7 @@ join_channel2(State, IP, Port, Username, ChannelName) ->
     Channel = maps:get(ChannelName, State#ss.channels, #channel{}),
     case lists:member(Username, Channel#channel.users) of
         true ->
-            case gen_udp:send(State#ss.socket, IP, Port, "already in channel: " ++ ChannelName) of
+            case gen_udp:send(State#ss.msp_proc, IP, Port, "already in channel: " ++ ChannelName) of
                 ok ->
                     ok;
                 {error, Reason} ->
@@ -141,7 +151,7 @@ join_channel2(State, IP, Port, Username, ChannelName) ->
 
             Users = [Username | Channel#channel.users],
 
-            case gen_udp:send(State#ss.socket, IP, Port, "joined channel: " ++ ChannelName) of
+            case gen_udp:send(State#ss.msp_proc, IP, Port, "joined channel: " ++ ChannelName) of
                 ok ->
                     ok;
                 {error, Reason} ->
@@ -195,7 +205,7 @@ add_message3(State, IP, Port, ChannelName, Message, Channel) ->
 add_message4(State, IP, Port, Username, ChannelName, Message, Channel) ->
     case lists:member(Username, Channel#channel.users) of
         true ->
-            case gen_udp:send(State#ss.socket, IP, Port, "message received") of
+            case gen_udp:send(State#ss.msp_proc, IP, Port, "message received") of
                 ok ->
                     ok;
                 {error, Reason} ->
@@ -228,7 +238,7 @@ update_channel(State, ChannelName) ->
 
 update_channel2(State, ChannelName, Channel) ->
     Mailbox = Channel#channel.mailbox,
-    NewMailbox = update_mailbox(State#ss.socket, State#ss.connections, Mailbox),
+    NewMailbox = update_mailbox(State#ss.msp_proc, State#ss.connections, Mailbox),
     io:format("Mailbox updated.~n"),
 
     NewChannelState = Channel#channel{mailbox = NewMailbox},

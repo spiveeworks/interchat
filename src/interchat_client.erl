@@ -4,20 +4,18 @@
 -export([prompt_worker/1]).
 
 -type input_mode() :: normal
-                      | {connect, inet:ip_address(), inet:port_number(),
-                         reference()}
                       | {username, inet:ip_address(), inet:port_number()}
                       | {send_username, inet:ip_address(), inet:port_number(),
                          string(), reference()}.
 
 
--record(cs, {socket, servers = [], input_mode = normal :: input_mode(),
+-record(cs, {msp_proc :: pid(), servers = [], input_mode = normal :: input_mode(),
              current_channel = none :: none | {inet:ip_address(), inet:port_number(), string()}}).
 
 start() ->
     io:format("Interchat client started. Enter '/help' for a list of commands.~n", []),
-    {ok, Socket} = gen_udp:open(0),
-    prompt_and_loop(#cs{socket = Socket}).
+    {ok, MSP} = msp:start_link(0),
+    prompt_and_loop(#cs{msp_proc = MSP}).
 
 prompt_worker(PID) ->
     Str = prompt(),
@@ -28,31 +26,15 @@ prompt_and_loop(State) ->
     maybe_spawn_prompt(State),
     loop(State).
 
-loop(State = #cs{socket = Socket, input_mode = InputMode}) ->
+loop(State = #cs{input_mode = InputMode}) ->
     receive
+        {user_input, eof} ->
+            % Print a newline for unix shells/files.
+            io:format("~n", []),
+            stop_fast();
         {user_input, Str} ->
             NewState = dispatch_input(State, Str),
             prompt_and_loop(NewState);
-        {udp, Socket, IP, Port, "connection accepted"} ->
-            case InputMode of
-                {connect, IP, Port, TRef} ->
-                    erlang:cancel_timer(TRef),
-                    io:format("Server found. What is your username?~n", []),
-                    NewState = State#cs{input_mode = {username, IP, Port}},
-                    prompt_and_loop(NewState);
-                _ ->
-                    loop(State)
-            end;
-        {udp, Socket, IP, Port, "already connected"} ->
-            case InputMode of
-                {connect, IP, Port, TRef} ->
-                    erlang:cancel_timer(TRef),
-                    io:format("The server says you are already connected to it.~n", []),
-                    NewState = State#cs{input_mode = normal},
-                    prompt_and_loop(NewState);
-                _ ->
-                    loop(State)
-            end;
         {udp, Socket, IP, Port, "username accepted: " ++ Username} ->
             case InputMode of
                 {send_username, IP, Port, Username, TRef} ->
@@ -78,14 +60,6 @@ loop(State = #cs{socket = Socket, input_mode = InputMode}) ->
         {udp, Socket, IP, Port, "message from " ++ Rest} ->
             display_message(State, IP, Port, Rest),
             loop(State);
-        {timeout, TRef, {connect, IP, Port}} ->
-            case InputMode of
-                {connect, IP, Port, TRef} ->
-                    io:format("Connection timed out.~n", []),
-                    prompt_and_loop(State#cs{input_mode = normal});
-                _ ->
-                    loop(State)
-            end;
         {timeout, TRef, {send_username, IP, Port, Username}} ->
             case InputMode of
                 {send_username, IP, Port, Username, TRef} ->
@@ -148,7 +122,7 @@ parse(State, Str) ->
                     State;
                 {IP, Port, Channel} ->
                     Datagram = "message in " ++ Channel ++ ": " ++ Str,
-                    case gen_udp:send(State#cs.socket, IP, Port, Datagram) of
+                    case gen_udp:send(State#cs.msp_proc, IP, Port, Datagram) of
                         ok ->
                             ok;
                         {error, Reason} ->
@@ -158,7 +132,7 @@ parse(State, Str) ->
             end
     end.
 
-reply_login(State = #cs{socket = Socket}, IP, Port, Str) ->
+reply_login(State = #cs{msp_proc = Socket}, IP, Port, Str) ->
     case word(Str) of
         {[$/ | _], ""} ->
             % FIXME: Usernames need to be a much more specific range of
@@ -180,10 +154,16 @@ reply_login(State = #cs{socket = Socket}, IP, Port, Str) ->
     end.
 
 prompt() ->
-    Input = io:get_line(">"),
-    case string:trim(Input) of
-        "" -> prompt();
-        NonEmpty -> NonEmpty
+    case io:get_line(">") of
+        eof ->
+            eof;
+        Input ->
+            case string:trim(Input) of
+                "" ->
+                    prompt();
+                NonEmpty ->
+                    NonEmpty
+            end
     end.
 
 word(Str) ->
@@ -209,19 +189,20 @@ connect(State, A) ->
             end
     end.
 
-connect(State = #cs{socket = Socket}, Host, Port) ->
-    case gen_udp:send(Socket, Host, Port, "interchat connect") of
+connect(State, Host, Port) ->
+    {ok, IP} = inet:getaddr(Host, inet),
+    io:format("Connecting to ~s...~n", [Host]),
+    case msp:connect(State#cs.msp_proc, IP, Port, self()) of
         ok ->
-            {ok, IP} = inet:getaddr(Host, inet),
-            TRef = erlang:start_timer(5000, self(), {connect, IP, Port}),
-            State#cs{input_mode = {connect, IP, Port, TRef}};
-        {error, Reason} ->
-            io:format("Error: ~p~n", [Reason]),
+            io:format("Server found. What is your username?~n", []),
+            State#cs{input_mode = {username, IP, Port}};
+        {error, timeout} ->
+            io:format("Connection timed out.~n", []),
             State
     end.
 
 join(State = #cs{servers = [{IP, Port, _}]}, Channel) ->
-    case gen_udp:send(State#cs.socket, IP, Port, "join " ++ Channel) of
+    case gen_udp:send(State#cs.msp_proc, IP, Port, "join " ++ Channel) of
         ok ->
             io:format("Attempting to join...~n", []),
             % TODO: wait for a response or timeout, rather than posting a
