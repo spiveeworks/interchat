@@ -35,29 +35,9 @@ loop(State = #cs{input_mode = InputMode}) ->
         {user_input, Str} ->
             NewState = dispatch_input(State, Str),
             prompt_and_loop(NewState);
-        {udp, Socket, IP, Port, "username accepted: " ++ Username} ->
-            case InputMode of
-                {send_username, IP, Port, Username, TRef} ->
-                    erlang:cancel_timer(TRef),
-                    io:format("Login successful.~n", []),
-                    Servers = [{IP, Port, Username} | State#cs.servers],
-                    NewState = State#cs{servers = Servers, input_mode = normal},
-                    prompt_and_loop(NewState);
-                _ ->
-                    io:format("Late login success? Ignoring.~n", []),
-                    loop(State)
-            end;
-        {udp, Socket, IP, Port, "username taken: " ++ Username} ->
-            case InputMode of
-                {send_username, IP, Port, Username, TRef} ->
-                    erlang:cancel_timer(TRef),
-                    io:format("Username taken. Try again.~n", []),
-                    NewState = State#cs{input_mode = {username, IP, Port}},
-                    prompt_and_loop(NewState);
-                _ ->
-                    loop(State)
-            end;
-        {udp, Socket, IP, Port, "message from " ++ Rest} ->
+        {msp_datagram, IP, Port, StreamID, Index, Yield, Data} ->
+            process_datagram(State, IP, Port, StreamID, Index, Yield, Data);
+        {udp, _Socket, IP, Port, "message from " ++ Rest} ->
             display_message(State, IP, Port, Rest),
             loop(State);
         {timeout, TRef, {send_username, IP, Port, Username}} ->
@@ -72,6 +52,25 @@ loop(State = #cs{input_mode = InputMode}) ->
             io:format("\rClient loop got unknown message:~n~p~n", [Message]),
             loop(State)
     end.
+
+process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}},
+                 IP, Port, StreamID, _Index, true, "accepted") ->
+    % TODO: What if they reply but with the wrong yield field/etc? We could
+    % detect incorrect replies early and stop waiting immediately.
+    erlang:cancel_timer(TRef),
+    io:format("Login successful.~n", []),
+    Servers = [{IP, Port, Username} | State#cs.servers],
+    NewState = State#cs{servers = Servers, input_mode = normal},
+    prompt_and_loop(NewState);
+process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, _Username, TRef}},
+                 IP, Port, StreamID, _Index, true, "taken") ->
+    erlang:cancel_timer(TRef),
+    io:format("Username taken. Try again.~n", []),
+    NewState = State#cs{input_mode = {username, IP, Port}},
+    prompt_and_loop(NewState);
+process_datagram(State, _IP, _Port, _StreamID, _Index, _Yield, Data) ->
+    io:format("\rClient loop got unexpected datagram: ~s~n", [Data]),
+    loop(State).
 
 dispatch_input(State = #cs{input_mode = normal}, Str) ->
     parse(State, Str);
@@ -132,7 +131,7 @@ parse(State, Str) ->
             end
     end.
 
-reply_login(State = #cs{msp_proc = Socket}, IP, Port, Str) ->
+reply_login(State, IP, Port, Str) ->
     case word(Str) of
         {[$/ | _], ""} ->
             % FIXME: Usernames need to be a much more specific range of
@@ -140,14 +139,9 @@ reply_login(State = #cs{msp_proc = Socket}, IP, Port, Str) ->
             io:format("Usernames cannot begin with a slash.~n", []),
             State;
         {Username, ""} ->
-            case gen_udp:send(Socket, IP, Port, "username: " ++ Username) of
-                ok ->
-                    TRef = erlang:start_timer(5000, self(), {send_username, IP, Port, Username}),
-                    State#cs{input_mode = {send_username, IP, Port, Username, TRef}};
-                {error, Reason} ->
-                    io:format("Error: ~p~n", [Reason]),
-                    State
-            end;
+            {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "username: " ++ Username, true),
+            TRef = erlang:start_timer(5000, self(), {send_username, IP, Port, Username}),
+            State#cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}};
         {_, _} ->
             io:format("Usernames must be a single word.~n", []),
             State

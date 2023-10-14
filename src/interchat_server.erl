@@ -33,16 +33,6 @@ loop(State) ->
         {get_state, PID} ->
             PID ! {interchat_server_state, State},
             loop(State);
-        {udp, Socket, IP, Port, "interchat connect"} ->
-            %NewState = accept(State, IP, Port),
-            NewState = State,
-            %inet:setopts(Socket, [{active, once}]),
-            loop(NewState);
-        {udp, Socket, IP, Port, "username: " ++ Username} ->
-            %NewState = check_username_chosen(State, IP, Port, Username),
-            NewState = State,
-            %inet:setopts(Socket, [{active, once}]),
-            loop(NewState);
         {udp, Socket, IP, Port, "join " ++ ChannelName} ->
             NewState = join_channel(State, IP, Port, ChannelName),
             inet:setopts(Socket, [{active, once}]),
@@ -51,78 +41,72 @@ loop(State) ->
             NewState = add_message(State, IP, Port, Rest),
             inet:setopts(Socket, [{active, once}]),
             loop(NewState);
-        {udp, Socket, IP, Port, Datagram} ->
-            io:format("~s:~w sent unexpected message ~s.~n", [inet:ntoa(IP), Port, Datagram]),
-            inet:setopts(Socket, [{active, once}]),
-            loop(State);
         {msp_connect, IP, Port} ->
-            % Log, but don't do anything until we get a username, since the msp
-            % process is already tracking the connection itself for us.
-            io:format("~s:~w connected.~n", [inet:ntoa(IP), Port]),
-            loop(State);
+            NewState = accept(State, IP, Port),
+            loop(NewState);
+        {msp_datagram, IP, Port, StreamID, 0, Yield, Data} ->
+            NewState = handle_new_stream(State, IP, Port, StreamID, Yield, Data),
+            loop(NewState);
+        {msp_datagram, IP, Port, StreamID, Index, Yield, Data} ->
+            NewState = handle_new_packet(State, IP, Port, StreamID, Index, Yield, Data),
+            loop(NewState);
         Message ->
             io:format("Got unknown message: ~p~n", [Message]),
             loop(State)
     end.
 
--ifdef(comment_out).
 accept(State, IP, Port) ->
-    Connections = State#ss.connections,
-    Socket = State#ss.socket,
-    case lists:keymember({IP, Port}, 1, Connections) of
-        true ->
-            case gen_udp:send(Socket, IP, Port, "already connected") of
-                ok ->
-                    io:format("~s:~w tried to connect again.~n", [inet:ntoa(IP), Port]),
-                    State;
-                {error, Reason} ->
-                    io:format("Connection reply failed with reason ~p.~n", [Reason]),
-                    State
-            end;
-        false ->
-            case gen_udp:send(Socket, IP, Port, "connection accepted") of
-                ok ->
-                    io:format("~s:~w connected.~n", [inet:ntoa(IP), Port]),
-                    NewConnections = [{{IP, Port}, not_chosen} | State#ss.connections],
-                    State#ss{connections = NewConnections};
-                {error, Reason} ->
-                    io:format("Connection reply failed with reason ~p.~n", [Reason]),
-                    State
-            end
-    end.
+    io:format("~s:~w connected.~n", [inet:ntoa(IP), Port]),
+    NewConnections = [{{IP, Port}, {not_chosen, no_stream}} | State#ss.connections],
+    State#ss{connections = NewConnections}.
 
-check_username_chosen(State, IP, Port, Username) ->
-    Connections = State#ss.connections,
-    Socket = State#ss.socket,
-    case lists:keyfind({IP, Port}, 1, Connections) of
-        {{IP, Port}, not_chosen} ->
-            case lists:keymember(Username, 2, Connections) of
-                true ->
-                    case gen_udp:send(Socket, IP, Port, "username taken: " ++ Username) of
-                        ok ->
-                            State;
-                        {error, Reason} ->
-                            io:format("Connection reply failed with reason ~p.~n", [Reason]),
-                            State
-                    end;
-                false ->
-                    case gen_udp:send(Socket, IP, Port, "username accepted: " ++ Username) of
-                        ok ->
-                            io:format("~s:~w chose username ~s.~n", [inet:ntoa(IP), Port, Username]),
-                            NewConnections = lists:keystore({IP, Port}, 1, Connections, {{IP, Port}, Username}),
-                            State#ss{connections = NewConnections};
-                        {error, Reason} ->
-                            io:format("Connection reply failed with reason ~p.~n", [Reason]),
-                            State
-                    end
-            end;
-        {{IP, Port}, _} ->
-            % Maybe this packet was sent earlier and arrived late. Ignore.
-            State;
-        false ->
+handle_new_stream(State, IP, Port, StreamID, true, "username: " ++ Username) ->
+    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
+        {{IP, Port}, {not_chosen, no_stream}} ->
+            Connection = {{IP, Port}, {not_chosen, StreamID}},
+            NewConnections = lists:keystore({IP, Port}, 1,
+                                            State#ss.connections, Connection),
+            NewState = State#ss{connections = NewConnections},
+            check_username_chosen(NewState, IP, Port, StreamID, Username);
+        _ ->
+            % Either they already started a stream for username negotiation, or
+            % they already chose a username! TODO: Reject the stream.
+    io:format("Connections: ~p~n", [State#ss.connections]),
             State
+    end;
+handle_new_stream(State, _, _, _, _, _) ->
+    % TODO: Reject the stream.
+    State.
+
+handle_new_packet(State, IP, Port, StreamID, _, true, "username: " ++ Username) ->
+    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
+        {{IP, Port}, {not_chosen, StreamID}} ->
+            % MSP says this is the next packet, and it is the right stream, so
+            % we don't need to check anything else, other than the username
+            % itself.
+            check_username_chosen(State, IP, Port, StreamID, Username);
+        _ ->
+            % Either a stream has already been started, or they already chose a
+            % username! TODO: Reject the stream.
+            State
+    end;
+handle_new_packet(State, _, _, _, _, _, _) ->
+    % TODO: Reject the stream.
+    State.
+
+
+check_username_chosen(State, IP, Port, StreamID, Username) ->
+    Connections = State#ss.connections,
+    case lists:keymember(Username, 2, Connections) of
+        true ->
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "taken", true);
+        false ->
+            % TODO: close stream?
+            io:format("~s:~w chose username ~s.~n", [inet:ntoa(IP), Port, Username]),
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "accepted", true),
+            NewConnections = lists:keystore({IP, Port}, 1, Connections, {{IP, Port}, Username}),
+            State#ss{connections = NewConnections}
     end.
--endif.
 
 join_channel(State, IP, Port, ChannelName) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
@@ -194,7 +178,7 @@ add_message2(State, IP, Port, ChannelName, Message) ->
 add_message3(State, IP, Port, ChannelName, Message, Channel) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
     case lists:keyfind({IP, Port}, 1, State#ss.connections) of
-        {{IP, Port}, not_chosen} ->
+        {{IP, Port}, {not_chosen, _}} ->
             State;
         {{IP, Port}, Username} ->
             add_message4(State, IP, Port, Username, ChannelName, Message, Channel);
