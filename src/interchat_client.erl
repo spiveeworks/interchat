@@ -4,13 +4,19 @@
 -export([prompt_worker/1]).
 
 -type input_mode() :: normal
-                      | {username, inet:ip_address(), inet:port_number()}
+                      | {username, inet:ip_address(), inet:port_number(), none | integer()}
                       | {send_username, inet:ip_address(), inet:port_number(),
-                         string(), reference()}.
+                         integer(), string(), reference()}.
 
+% TODO: Make connect a pending command? Make join an input_mode command?
+-type pending_command() :: {join, string()}.
 
--record(cs, {msp_proc :: pid(), servers = [], input_mode = normal :: input_mode(),
-             current_channel = none :: none | {inet:ip_address(), inet:port_number(), string()}}).
+-record(cs, {msp_proc :: pid(),
+             servers = [],
+             input_mode = normal :: input_mode(),
+             pending_commands = #{} :: #{integer() => pending_command()},
+             % TODO: Make this tuple an actual record?
+             current_channel = none :: none | {inet:ip_address(), inet:port_number(), string(), none | integer()}}).
 
 start() ->
     io:format("Interchat client started. Enter '/help' for a list of commands.~n", []),
@@ -40,9 +46,11 @@ loop(State = #cs{input_mode = InputMode}) ->
         {udp, _Socket, IP, Port, "message from " ++ Rest} ->
             display_message(State, IP, Port, Rest),
             loop(State);
+        % TODO: Make MSP handle this timeout and give an msp_timout message, so
+        % we don't have to cancel the timer ourselves on success.
         {timeout, TRef, {send_username, IP, Port, Username}} ->
             case InputMode of
-                {send_username, IP, Port, Username, TRef} ->
+                {send_username, IP, Port, _StreamID, Username, TRef} ->
                     io:format("Connection timed out.~n", []),
                     prompt_and_loop(State#cs{input_mode = normal});
                 _ ->
@@ -66,16 +74,32 @@ process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, _U
                  IP, Port, StreamID, _Index, true, "taken") ->
     erlang:cancel_timer(TRef),
     io:format("Username taken. Try again.~n", []),
-    NewState = State#cs{input_mode = {username, IP, Port}},
+    NewState = State#cs{input_mode = {username, IP, Port, StreamID}},
     prompt_and_loop(NewState);
-process_datagram(State, _IP, _Port, _StreamID, _Index, _Yield, Data) ->
-    io:format("\rClient loop got unexpected datagram: ~s~n", [Data]),
-    loop(State).
+process_datagram(State, IP, Port, StreamID, _Index, _Yield, Data) ->
+    case maps:take(StreamID, State#cs.pending_commands) of
+        {{join, Channel}, StillPending} ->
+            NewState = State#cs{pending_commands = StillPending},
+            case Data of
+                "successfully joined" ->
+                    io:format("Joined channel ~s.~n", [Channel]),
+                    NewState2 = NewState#cs{current_channel = {IP, Port, Channel, none}},
+                    prompt_and_loop(NewState2);
+                "already joined" ->
+                    io:format("Already in channel ~s.~n", [Channel]),
+                    prompt_and_loop(NewState)
+            end;
+        error ->
+            % TODO: Use the more detailed message format that the server uses?
+            % TODO: Actually reject the message?
+            io:format("\rClient loop got unexpected datagram: ~s~n", [Data]),
+            prompt_and_loop(State)
+    end.
 
 dispatch_input(State = #cs{input_mode = normal}, Str) ->
     parse(State, Str);
-dispatch_input(State = #cs{input_mode = {username, IP, Port}}, Str) ->
-    reply_login(State, IP, Port, Str);
+dispatch_input(State = #cs{input_mode = {username, IP, Port, StreamID}}, Str) ->
+    reply_login(State, IP, Port, Str, StreamID);
 dispatch_input(State = #cs{input_mode = Mode}, _) ->
     io:format("Got unexpected input from prompt worker?~n", []),
     io:format("Mode is ~p.~n", [Mode]),
@@ -83,7 +107,7 @@ dispatch_input(State = #cs{input_mode = Mode}, _) ->
 
 maybe_spawn_prompt(#cs{input_mode = normal}) ->
     spawn(?MODULE, prompt_worker, [self()]);
-maybe_spawn_prompt(#cs{input_mode = {username, _, _}}) ->
+maybe_spawn_prompt(#cs{input_mode = {username, _, _, _}}) ->
     spawn(?MODULE, prompt_worker, [self()]);
 maybe_spawn_prompt(#cs{input_mode = _}) ->
     ok.
@@ -119,19 +143,21 @@ parse(State, Str) ->
                 none ->
                     io:format("No channel has been selected.~n", []),
                     State;
-                {IP, Port, Channel} ->
-                    Datagram = "message in " ++ Channel ++ ": " ++ Str,
-                    case gen_udp:send(State#cs.msp_proc, IP, Port, Datagram) of
-                        ok ->
-                            ok;
-                        {error, Reason} ->
-                            io:format("Error: ~p~n", [Reason])
-                    end,
-                    State
+                {IP, Port, Channel, StreamID} ->
+                    send_message(State, IP, Port, Channel, StreamID, Str)
             end
     end.
 
-reply_login(State, IP, Port, Str) ->
+send_message(State, IP, Port, Channel, none, Str) ->
+    Datagram = "message in " ++ Channel ++ ": " ++ Str,
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), Datagram, false),
+    State#cs{current_channel = {IP, Port, Channel, StreamID}};
+send_message(State, IP, Port, Channel, StreamID, Str) ->
+    Datagram = "message in " ++ Channel ++ ": " ++ Str,
+    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID, Datagram, false),
+    State.
+
+reply_login(State, IP, Port, Str, StreamID) ->
     case word(Str) of
         {[$/ | _], ""} ->
             % FIXME: Usernames need to be a much more specific range of
@@ -139,13 +165,23 @@ reply_login(State, IP, Port, Str) ->
             io:format("Usernames cannot begin with a slash.~n", []),
             State;
         {Username, ""} ->
-            {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "username: " ++ Username, true),
-            TRef = erlang:start_timer(5000, self(), {send_username, IP, Port, Username}),
-            State#cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}};
+            reply_login2(State, IP, Port, Username, StreamID);
         {_, _} ->
             io:format("Usernames must be a single word.~n", []),
             State
     end.
+
+reply_login2(State, IP, Port, Username, none) ->
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "username: " ++ Username, true),
+    reply_login3(State, IP, Port, Username, StreamID);
+reply_login2(State, IP, Port, Username, StreamID) ->
+    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID, "username: " ++ Username, true),
+    reply_login3(State, IP, Port, Username, StreamID).
+
+reply_login3(State, IP, Port, Username, StreamID) ->
+    TRef = erlang:start_timer(5000, self(), {send_username, IP, Port, Username}),
+    State#cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}}.
+
 
 prompt() ->
     case io:get_line(">") of
@@ -189,23 +225,18 @@ connect(State, Host, Port) ->
     case msp:connect(State#cs.msp_proc, IP, Port, self()) of
         ok ->
             io:format("Server found. What is your username?~n", []),
-            State#cs{input_mode = {username, IP, Port}};
+            State#cs{input_mode = {username, IP, Port, none}};
         {error, timeout} ->
             io:format("Connection timed out.~n", []),
             State
     end.
 
 join(State = #cs{servers = [{IP, Port, _}]}, Channel) ->
-    case gen_udp:send(State#cs.msp_proc, IP, Port, "join " ++ Channel) of
-        ok ->
-            io:format("Attempting to join...~n", []),
-            % TODO: wait for a response or timeout, rather than posting a
-            % prompt ">" prematurely?
-            State#cs{current_channel = {IP, Port, Channel}};
-        {error, Reason} ->
-            io:format("Error: ~p~n", [Reason]),
-            State
-    end;
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "join " ++ Channel, true),
+    io:format("Attempting to join...~n", []),
+    NewPendingCommands = maps:put(StreamID, {join, Channel},
+                                  State#cs.pending_commands),
+    State#cs{pending_commands = NewPendingCommands};
 join(State = #cs{servers = []}, _) ->
     io:format("Error: Use /connect to connect to a server first.~n"),
     State;

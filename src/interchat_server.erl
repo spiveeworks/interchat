@@ -9,8 +9,13 @@
 
 -record(channel, {users = [] :: [string()], mailbox = []}).
 
+-record(connection, {address :: {inet:ip_address(), inet:port_number()},
+                     username = {not_chosen, no_stream} :: string() | {not_chosen, no_stream | integer()},
+                     streams_up = #{} :: #{string() => integer()},
+                     streams_down = #{} :: #{string() => integer()}}).
+
 -record(ss, {msp_proc :: pid(),
-             connections = [],
+             connections = [] :: [#connection{}],
              channels = #{} :: #{string() => #channel{}},
              lobby = 0 :: integer()}).
 
@@ -33,10 +38,6 @@ loop(State) ->
         {get_state, PID} ->
             PID ! {interchat_server_state, State},
             loop(State);
-        {udp, Socket, IP, Port, "join " ++ ChannelName} ->
-            NewState = join_channel(State, IP, Port, ChannelName),
-            inet:setopts(Socket, [{active, once}]),
-            loop(NewState);
         {udp, Socket, IP, Port, "message in " ++ Rest} ->
             NewState = add_message(State, IP, Port, Rest),
             inet:setopts(Socket, [{active, once}]),
@@ -57,30 +58,34 @@ loop(State) ->
 
 accept(State, IP, Port) ->
     io:format("~s:~w connected.~n", [inet:ntoa(IP), Port]),
-    NewConnections = [{{IP, Port}, {not_chosen, no_stream}} | State#ss.connections],
+    NewConnections = [#connection{address = {IP, Port}} | State#ss.connections],
     State#ss{connections = NewConnections}.
 
 handle_new_stream(State, IP, Port, StreamID, true, "username: " ++ Username) ->
-    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
-        {{IP, Port}, {not_chosen, no_stream}} ->
-            Connection = {{IP, Port}, {not_chosen, StreamID}},
-            NewConnections = lists:keystore({IP, Port}, 1,
-                                            State#ss.connections, Connection),
+    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
+        Connection = #connection{username = {not_chosen, no_stream}} ->
+            NewConnection = Connection#connection{username = {not_chosen, StreamID}},
+            NewConnections = lists:keystore({IP, Port}, #connection.address,
+                                            State#ss.connections, NewConnection),
             NewState = State#ss{connections = NewConnections},
             check_username_chosen(NewState, IP, Port, StreamID, Username);
         _ ->
             % Either they already started a stream for username negotiation, or
             % they already chose a username! TODO: Reject the stream.
-    io:format("Connections: ~p~n", [State#ss.connections]),
             State
     end;
-handle_new_stream(State, _, _, _, _, _) ->
+handle_new_stream(State, IP, Port, StreamID, true, "join " ++ ChannelName) ->
+    join_channel(State, IP, Port, StreamID, ChannelName);
+%handle_new_stream(State, IP, Port, StreamID, false, "post in " ++ ChannelName) ->
+    %add_message_upload_stream(State, IP, Port, StreamID, ChannelName);
+handle_new_stream(State, IP, Port, StreamID, Yield, Datagram) ->
     % TODO: Reject the stream.
+    log_datagram(IP, Port, StreamID, 0, Yield, Datagram),
     State.
 
 handle_new_packet(State, IP, Port, StreamID, _, true, "username: " ++ Username) ->
-    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
-        {{IP, Port}, {not_chosen, StreamID}} ->
+    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
+        #connection{username = {not_chosen, StreamID}} ->
             % MSP says this is the next packet, and it is the right stream, so
             % we don't need to check anything else, other than the username
             % itself.
@@ -90,69 +95,78 @@ handle_new_packet(State, IP, Port, StreamID, _, true, "username: " ++ Username) 
             % username! TODO: Reject the stream.
             State
     end;
-handle_new_packet(State, _, _, _, _, _, _) ->
+handle_new_packet(State, IP, Port, StreamID, PacketID, Yield, Datagram) ->
     % TODO: Reject the stream.
+    log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram),
     State.
+
+log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram) ->
+    % TODO: Reject the stream.
+    YieldStr = case Yield of
+                   true  -> "(yield)";
+                   false -> "(...)"
+               end,
+    io:format("~s:~w sent unexpected packet ~p.~p: ~s ~s~n",
+              [inet:ntoa(IP), Port, StreamID, PacketID, Datagram, YieldStr]).
 
 
 check_username_chosen(State, IP, Port, StreamID, Username) ->
     Connections = State#ss.connections,
-    case lists:keymember(Username, 2, Connections) of
+    case lists:keymember(Username, #connection.username, Connections) of
         true ->
-            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "taken", true);
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "taken", true),
+            State;
         false ->
             % TODO: close stream?
             io:format("~s:~w chose username ~s.~n", [inet:ntoa(IP), Port, Username]),
             {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "accepted", true),
-            NewConnections = lists:keystore({IP, Port}, 1, Connections, {{IP, Port}, Username}),
+            Connection = #connection{address = {IP, Port},
+                                     username = Username},
+            NewConnections = lists:keystore({IP, Port}, #connection.address,
+                                            Connections, Connection),
             State#ss{connections = NewConnections}
     end.
 
-join_channel(State, IP, Port, ChannelName) ->
+join_channel(State, IP, Port, StreamID, ChannelName) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
-    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
-        {{IP, Port}, not_chosen} ->
+    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
+        #connection{username = {not_chosen, _}} ->
+            % TODO: Reject the packet
             State;
-        {{IP, Port}, Username} ->
-            join_channel2(State, IP, Port, Username, ChannelName);
+        #connection{username = Username} ->
+            join_channel2(State, IP, Port, StreamID, Username, ChannelName);
         false ->
             State
     end.
 
-join_channel2(State, IP, Port, Username, ChannelName) ->
+join_channel2(State, IP, Port, StreamID, Username, ChannelName) ->
     Channel = maps:get(ChannelName, State#ss.channels, #channel{}),
     case lists:member(Username, Channel#channel.users) of
         true ->
-            case gen_udp:send(State#ss.msp_proc, IP, Port, "already in channel: " ++ ChannelName) of
-                ok ->
-                    ok;
-                {error, Reason} ->
-                    io:format("Redundant join reply failed with reason ~p.~n", [Reason])
-            end,
+            %TODO: Add a third yield mode, to close the stream.
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "already joined", true),
             State;
         false ->
             io:format("User ~s joined channel ~s.~n", [Username, ChannelName]),
 
             Users = [Username | Channel#channel.users],
+            NewChannel = Channel#channel{users = Users},
 
-            case gen_udp:send(State#ss.msp_proc, IP, Port, "joined channel: " ++ ChannelName) of
-                ok ->
-                    ok;
-                {error, Reason} ->
-                    io:format("Join reply failed with reason ~p.~n", [Reason])
-            end,
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "successfully joined", true),
 
             NewMessage = #message{sender = server,
                                   remaining_users = Channel#channel.users,
                                   timestamp_ms = os:system_time(millisecond),
                                   message = Username ++ " joined."},
-            Messages = Channel#channel.mailbox ++ [NewMessage],
-            NewChannelState = Channel#channel{users = Users, mailbox = Messages},
 
-            NewChannels = maps:put(ChannelName, NewChannelState, State#ss.channels),
-            NewState = State#ss{channels = NewChannels},
+            {NewConnections, NewChannel2} = mailbox_add_message(State#ss.msp_proc,
+                                                                State#ss.connections,
+                                                                NewMessage,
+                                                                ChannelName,
+                                                                NewChannel),
 
-            update_channel(NewState, ChannelName)
+            NewChannels = maps:put(ChannelName, NewChannel2, State#ss.channels),
+            State#ss{connections = NewConnections, channels = NewChannels}
     end.
 
 add_message(State, IP, Port, Rest) ->
@@ -177,41 +191,96 @@ add_message2(State, IP, Port, ChannelName, Message) ->
 
 add_message3(State, IP, Port, ChannelName, Message, Channel) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
-    case lists:keyfind({IP, Port}, 1, State#ss.connections) of
-        {{IP, Port}, {not_chosen, _}} ->
+    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
+        #connection{username = {not_chosen, _}} ->
             State;
-        {{IP, Port}, Username} ->
-            add_message4(State, IP, Port, Username, ChannelName, Message, Channel);
+        #connection{username = Username} ->
+            add_message4(State, Username, ChannelName, Message, Channel);
         false ->
             State
     end.
 
-add_message4(State, IP, Port, Username, ChannelName, Message, Channel) ->
+add_message4(State, Username, ChannelName, Message, Channel) ->
     case lists:member(Username, Channel#channel.users) of
         true ->
-            case gen_udp:send(State#ss.msp_proc, IP, Port, "message received") of
-                ok ->
-                    ok;
-                {error, Reason} ->
-                    io:format("Message reply failed with reason ~p.~n", [Reason])
-            end,
-
             NewMessage = #message{sender = Username,
                                   remaining_users = lists:delete(Username, Channel#channel.users),
                                   timestamp_ms = os:system_time(millisecond),
                                   message = Message},
-            Messages = Channel#channel.mailbox ++ [NewMessage],
-            NewChannelState = Channel#channel{mailbox = Messages},
+            {NewConnections, NewChannel} = mailbox_add_message(State#ss.msp_proc,
+                                                               State#ss.connections,
+                                                               NewMessage,
+                                                               ChannelName,
+                                                               Channel),
 
-            NewChannels = maps:put(ChannelName, NewChannelState, State#ss.channels),
-            NewState = State#ss{channels = NewChannels},
-
-            update_channel(NewState, ChannelName);
+            NewChannels = maps:put(ChannelName, NewChannel, State#ss.channels),
+            State#ss{connections = NewConnections, channels = NewChannels};
         false ->
             State
     end.
 
+mailbox_add_message(MSP, Connections, Message, ChannelName, Channel) ->
+    Datagram = message_datagram(Message),
+    Users = Message#message.remaining_users,
+    NewConnections = try_send_message(MSP, Connections, Datagram, ChannelName, Users),
 
+    Messages = Channel#channel.mailbox ++ [Message],
+    NewChannelState = Channel#channel{mailbox = Messages},
+    {NewConnections, NewChannelState}.
+
+
+try_send_message(MSP, Connections, Datagram, ChannelName, [Username | Rest]) ->
+    case try_send_message_each(MSP, Connections, Datagram, ChannelName, Username) of
+        {ok, NewConnections} ->
+            try_send_message(MSP, NewConnections, Datagram, ChannelName, Rest);
+        error ->
+            try_send_message(MSP, Connections, Datagram, ChannelName, Rest)
+    end;
+try_send_message(_, ConnectionsAfter, _, _, []) ->
+    ConnectionsAfter.
+
+try_send_message_each(MSP, Connections, Datagram, ChannelName, Username) ->
+    case lists:keytake(Username, #connection.username, Connections) of
+        % TODO: If we don't end up modifying the connection, do we even need to
+        % remove it and add it back? Would it be any cheaper not to keytake?
+        {value, Connection, ConnectionsWithout} ->
+            NewConnection = try_send_message_each_connection(MSP, Datagram, ChannelName, Connection),
+
+            NewConnections = [NewConnection | ConnectionsWithout],
+            {ok, NewConnections};
+        false ->
+            error
+    end.
+
+try_send_message_each_connection(MSP, Datagram, ChannelName, Connection) ->
+    {IP, Port} = Connection#connection.address,
+    case maps:find(ChannelName, Connection#connection.streams_down) of
+        {ok, StreamID} ->
+            {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
+                                        false),
+            Connection;
+        error ->
+            {ok, StreamID} = msp:open_stream(MSP, IP, Port, self(),
+                                             "messages in " ++ ChannelName,
+                                             false),
+            {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
+                                        false),
+            NewStreams = maps:put(ChannelName, StreamID,
+                                  Connection#connection.streams_down),
+            Connection#connection{streams_down = NewStreams}
+    end.
+
+message_datagram(#message{sender = Sender, timestamp_ms = TSMS, message = Payload}) ->
+    SenderName = case Sender of
+                     server -> "server";
+                     _      -> Sender
+                 end,
+    IOL = io_lib:format("sender: ~s, ts: ~p, payload: ~s", [SenderName, TSMS, Payload]),
+    unicode:characters_to_list(IOL).
+
+-ifdef(comment).
+% We want to use this code as a basis for updating new logins with their
+% mailbox
 update_channel(State, ChannelName) ->
     case maps:find(ChannelName, State#ss.channels) of
         {ok, Channel} ->
@@ -251,50 +320,5 @@ update_message(Socket, Connections, UsersTried, Message) ->
                      _  -> Message#message{remaining_users = NewRemaining}
                  end,
     {NewTried, NewMessage}.
-
-try_send_message(Socket, Connections, UsersTried, Message, [Username | Rest], Acc) ->
-    case lists:member(Username, UsersTried) of
-        false ->
-            case try_send_message_each(Socket, Connections, Message, Username) of
-                ok ->
-                    % success; remove from mailbox, TODO: do we really still mark user as tried?
-                    try_send_message(Socket, Connections, [Username | UsersTried], Message, Rest,
-                                     Acc);
-                error ->
-                    % failed; mark as tried, and also as not sent.
-                    try_send_message(Socket, Connections, [Username | UsersTried],
-                                     Message, Rest, [Username | Acc])
-            end;
-        true ->
-            try_send_message(Socket, Connections, UsersTried, Message, Rest,
-                             [Username | Acc])
-    end;
-try_send_message(_, _, UsersTried, _, [], Acc) ->
-    NewRemaining = lists:reverse(Acc),
-    {UsersTried, NewRemaining}.
-
-try_send_message_each(Socket, Connections, Message, Username) ->
-    case lists:keyfind(Username, 2, Connections) of
-        {{IP, Port}, Username} ->
-            try_send_message_each2(Socket, Message, IP, Port);
-        false ->
-            error
-    end.
-
-try_send_message_each2(Socket, Message, IP, Port) ->
-    Datagram = message_datagram(Message),
-    case gen_udp:send(Socket, IP, Port, Datagram) of
-        ok ->
-            ok;
-        {error, _} ->
-            error
-    end.
-
-message_datagram(#message{sender = Sender, timestamp_ms = TSMS, message = Payload}) ->
-    SenderName = case Sender of
-                     server -> "server";
-                     _      -> Sender
-                 end,
-    IOL = io_lib:format("message from ~s, ts: ~p, payload: ~s", [SenderName, TSMS, Payload]),
-    unicode:characters_to_list(IOL).
+-endif.
 
