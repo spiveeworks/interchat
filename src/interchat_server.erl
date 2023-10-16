@@ -11,8 +11,8 @@
 
 -record(connection, {address :: {inet:ip_address(), inet:port_number()},
                      username = {not_chosen, no_stream} :: string() | {not_chosen, no_stream | integer()},
-                     streams_up = #{} :: #{string() => integer()},
-                     streams_down = #{} :: #{string() => integer()}}).
+                     streams_in = #{} :: #{integer() => string()},
+                     streams_out = #{} :: #{string() => integer()}}).
 
 -record(ss, {msp_proc :: pid(),
              connections = [] :: [#connection{}],
@@ -38,10 +38,6 @@ loop(State) ->
         {get_state, PID} ->
             PID ! {interchat_server_state, State},
             loop(State);
-        {udp, Socket, IP, Port, "message in " ++ Rest} ->
-            NewState = add_message(State, IP, Port, Rest),
-            inet:setopts(Socket, [{active, once}]),
-            loop(NewState);
         {msp_connect, IP, Port} ->
             NewState = accept(State, IP, Port),
             loop(NewState);
@@ -61,9 +57,20 @@ accept(State, IP, Port) ->
     NewConnections = [#connection{address = {IP, Port}} | State#ss.connections],
     State#ss{connections = NewConnections}.
 
-handle_new_stream(State, IP, Port, StreamID, true, "username: " ++ Username) ->
+handle_new_stream(State, IP, Port, StreamID, Yield, Data) ->
     case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
-        Connection = #connection{username = {not_chosen, no_stream}} ->
+        Connection = #connection{} ->
+            handle_new_stream2(State, IP, Port, StreamID, Yield, Data,
+                               Connection);
+        false ->
+            % TODO: Reject the stream?
+            io:format("\rUnknown address ~s:~p managed to open a stream? Message: ~s~n",
+                      [inet:ntoa(IP), Port, Data])
+    end.
+
+handle_new_stream2(State, IP, Port, StreamID, true, "username: " ++ Username, Connection) ->
+    case Connection#connection.username of
+        {not_chosen, no_stream} ->
             NewConnection = Connection#connection{username = {not_chosen, StreamID}},
             NewConnections = lists:keystore({IP, Port}, #connection.address,
                                             State#ss.connections, NewConnection),
@@ -74,31 +81,63 @@ handle_new_stream(State, IP, Port, StreamID, true, "username: " ++ Username) ->
             % they already chose a username! TODO: Reject the stream.
             State
     end;
-handle_new_stream(State, IP, Port, StreamID, true, "join " ++ ChannelName) ->
-    join_channel(State, IP, Port, StreamID, ChannelName);
-%handle_new_stream(State, IP, Port, StreamID, false, "post in " ++ ChannelName) ->
-    %add_message_upload_stream(State, IP, Port, StreamID, ChannelName);
-handle_new_stream(State, IP, Port, StreamID, Yield, Datagram) ->
+handle_new_stream2(State, IP, Port, StreamID, true, "join " ++ ChannelName, Connection) ->
+    join_channel(State, IP, Port, StreamID, ChannelName, Connection);
+handle_new_stream2(State, IP, Port, StreamID, false, "messages in " ++ ChannelName, Connection) ->
+    add_message_upload_stream(State, IP, Port, StreamID, ChannelName, Connection);
+handle_new_stream2(State, IP, Port, StreamID, Yield, Datagram, _Connection) ->
     % TODO: Reject the stream.
     log_datagram(IP, Port, StreamID, 0, Yield, Datagram),
     State.
 
-handle_new_packet(State, IP, Port, StreamID, _, true, "username: " ++ Username) ->
-    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
-        #connection{username = {not_chosen, StreamID}} ->
-            % MSP says this is the next packet, and it is the right stream, so
-            % we don't need to check anything else, other than the username
-            % itself.
-            check_username_chosen(State, IP, Port, StreamID, Username);
-        _ ->
-            % Either a stream has already been started, or they already chose a
-            % username! TODO: Reject the stream.
+add_message_upload_stream(State, IP, Port, StreamID, ChannelName, Connection) ->
+    case maps:find(ChannelName, State#ss.channels) of
+        {ok, Channel} ->
+            add_message_upload_stream2(State, IP, Port, StreamID, ChannelName,
+                                      Connection, Channel);
+        error ->
+            % TODO: Reject the stream.
             State
-    end;
-handle_new_packet(State, IP, Port, StreamID, PacketID, Yield, Datagram) ->
-    % TODO: Reject the stream.
-    log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram),
-    State.
+    end.
+
+add_message_upload_stream2(State, IP, Port, StreamID, ChannelName, Connection, Channel) ->
+    case lists:member(Connection#connection.username, Channel#channel.users) of
+        true ->
+            Streams = maps:put(StreamID,
+                               ChannelName,
+                               Connection#connection.streams_in),
+            % Now rebuild all the state.
+            NewConnection = Connection#connection{streams_in = Streams},
+            Connections = lists:keystore({IP, Port}, #connection.address,
+                                         State#ss.connections, NewConnection),
+            State#ss{connections = Connections};
+        false ->
+            % TODO: Reject the stream.
+            State
+    end.
+
+handle_new_packet(State, IP, Port, StreamID, Index, Yield, Datagram) ->
+    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
+        Connection = #connection{} ->
+            handle_new_packet2(State, IP, Port, StreamID, Index, Yield,
+                               Datagram, Connection);
+        false ->
+            % TODO: Reject the stream.
+            log_datagram(IP, Port, StreamID, Index, Yield, Datagram),
+            State
+    end.
+
+handle_new_packet2(State, IP, Port, StreamID, _, true, "username: " ++ Username, #connection{username = {not_chosen, StreamID}}) ->
+    check_username_chosen(State, IP, Port, StreamID, Username);
+handle_new_packet2(State, IP, Port, StreamID, PacketID, Yield, Datagram, Connection) ->
+    case maps:find(StreamID, Connection#connection.streams_in) of
+        {ok, ChannelName} ->
+            add_message(State, IP, Port, ChannelName, Datagram);
+        error ->
+            % TODO: Reject the stream.
+            log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram),
+            State
+    end.
 
 log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram) ->
     % TODO: Reject the stream.
@@ -127,19 +166,11 @@ check_username_chosen(State, IP, Port, StreamID, Username) ->
             State#ss{connections = NewConnections}
     end.
 
-join_channel(State, IP, Port, StreamID, ChannelName) ->
+join_channel(State, _IP, _Port, _StreamID, _ChannelName, #connection{username = {not_chosen, _}}) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
-    case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
-        #connection{username = {not_chosen, _}} ->
-            % TODO: Reject the packet
-            State;
-        #connection{username = Username} ->
-            join_channel2(State, IP, Port, StreamID, Username, ChannelName);
-        false ->
-            State
-    end.
-
-join_channel2(State, IP, Port, StreamID, Username, ChannelName) ->
+    % or just reject the packet?
+    State;
+join_channel(State, IP, Port, StreamID, ChannelName, #connection{username = Username}) ->
     Channel = maps:get(ChannelName, State#ss.channels, #channel{}),
     case lists:member(Username, Channel#channel.users) of
         true ->
@@ -149,13 +180,14 @@ join_channel2(State, IP, Port, StreamID, Username, ChannelName) ->
         false ->
             io:format("User ~s joined channel ~s.~n", [Username, ChannelName]),
 
-            Users = [Username | Channel#channel.users],
+            UsersWithout = Channel#channel.users,
+            Users = [Username | UsersWithout],
             NewChannel = Channel#channel{users = Users},
 
             {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "successfully joined", true),
 
             NewMessage = #message{sender = server,
-                                  remaining_users = Channel#channel.users,
+                                  remaining_users = UsersWithout,
                                   timestamp_ms = os:system_time(millisecond),
                                   message = Username ++ " joined."},
 
@@ -169,38 +201,26 @@ join_channel2(State, IP, Port, StreamID, Username, ChannelName) ->
             State#ss{connections = NewConnections, channels = NewChannels}
     end.
 
-add_message(State, IP, Port, Rest) ->
-    case string:split(Rest, ": ") of
-        [_, ""] ->
-            State;
-        ["", _] ->
-            State;
-        [ChannelName, Message] ->
-            add_message2(State, IP, Port, ChannelName, Message);
-        _ ->
-            State
-    end.
-
-add_message2(State, IP, Port, ChannelName, Message) ->
+add_message(State, IP, Port, ChannelName, Message) ->
     case maps:find(ChannelName, State#ss.channels) of
         {ok, Channel} ->
-            add_message3(State, IP, Port, ChannelName, Message, Channel);
+            add_message2(State, IP, Port, ChannelName, Message, Channel);
         error ->
             State
     end.
 
-add_message3(State, IP, Port, ChannelName, Message, Channel) ->
+add_message2(State, IP, Port, ChannelName, Message, Channel) ->
     % TODO: reply with error messages? Or assume they are malicious and ignore?
     case lists:keyfind({IP, Port}, #connection.address, State#ss.connections) of
         #connection{username = {not_chosen, _}} ->
             State;
         #connection{username = Username} ->
-            add_message4(State, Username, ChannelName, Message, Channel);
+            add_message3(State, Username, ChannelName, Message, Channel);
         false ->
             State
     end.
 
-add_message4(State, Username, ChannelName, Message, Channel) ->
+add_message3(State, Username, ChannelName, Message, Channel) ->
     case lists:member(Username, Channel#channel.users) of
         true ->
             NewMessage = #message{sender = Username,
@@ -254,7 +274,7 @@ try_send_message_each(MSP, Connections, Datagram, ChannelName, Username) ->
 
 try_send_message_each_connection(MSP, Datagram, ChannelName, Connection) ->
     {IP, Port} = Connection#connection.address,
-    case maps:find(ChannelName, Connection#connection.streams_down) of
+    case maps:find(ChannelName, Connection#connection.streams_out) of
         {ok, StreamID} ->
             {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
                                         false),
@@ -266,8 +286,8 @@ try_send_message_each_connection(MSP, Datagram, ChannelName, Connection) ->
             {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
                                         false),
             NewStreams = maps:put(ChannelName, StreamID,
-                                  Connection#connection.streams_down),
-            Connection#connection{streams_down = NewStreams}
+                                  Connection#connection.streams_out),
+            Connection#connection{streams_out = NewStreams}
     end.
 
 message_datagram(#message{sender = Sender, timestamp_ms = TSMS, message = Payload}) ->
