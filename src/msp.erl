@@ -60,7 +60,8 @@ trust_stream(PID, IP, Port, StreamID) ->
                      event_listener :: pid(),
                      trusted = false :: boolean()}).
 -record(msp_peer, {streams = #{} :: #{integer() => #msp_stream{}},
-                   stream_open_listener :: pid()}).
+                   stream_open_listener :: pid(),
+                   id_pattern :: even | odd}).
 -record(msp_pending_peer, {address :: endpoint(),
                            timeout_ref :: reference(),
                            timeout_count = 0 :: integer(),
@@ -201,7 +202,10 @@ do_accept(State, IP, Port) ->
             erlang:send(ConnectListener, {msp_connect, IP, Port}),
 
             % Now add them as a peer and continue with msp business.
-            Peer = #msp_peer{stream_open_listener = OpenListener},
+            Peer = #msp_peer{stream_open_listener = OpenListener,
+                             % We are acting as a server, we get the nice even
+                             % streams
+                             id_pattern = even},
             NewPeers = maps:put({IP, Port}, Peer, State#msp_state.peers),
             State#msp_state{peers = NewPeers}
     end.
@@ -256,7 +260,10 @@ do_connection_success(State, IP, Port) ->
 
             OpenListener = Pending#msp_pending_peer.stream_open_listener,
             % TODO: Should servers default to being trusted? or?
-            Peer = #msp_peer{stream_open_listener = OpenListener},
+            Peer = #msp_peer{stream_open_listener = OpenListener,
+                             % We are acting as a client, we get sad old odd
+                             % streams
+                             id_pattern = odd},
             NewPeers = maps:put({IP, Port}, Peer, State#msp_state.peers),
             State#msp_state{pending_peers = NewPending,
                             peers = NewPeers};
@@ -289,14 +296,15 @@ do_open_stream(State, IP, Port, HandlerPID, FirstPayload, FirstYield, Caller) ->
             gen_server:reply(Caller, {error, not_connected})
     end.
 
-choose_stream_id(#msp_peer{streams = Streams}) ->
-    Attempt1 = maps:size(Streams),
-    choose_stream_id(Streams, Attempt1).
+choose_stream_id(#msp_peer{streams = Streams, id_pattern = even}) ->
+    choose_stream_id(Streams, 0);
+choose_stream_id(#msp_peer{streams = Streams, id_pattern = odd}) ->
+    choose_stream_id(Streams, 1).
 
 choose_stream_id(Streams, Attempt) ->
     case maps:is_key(Attempt, Streams) of
         true ->
-            choose_stream_id(Streams, Attempt + 1);
+            choose_stream_id(Streams, Attempt + 2);
         false ->
             Attempt
     end.
@@ -397,46 +405,14 @@ do_handle_datagram(State, IP, Port, StreamID, Index, Yield, Payload) ->
             State
     end.
 
-do_handle_datagram2(State, IP, Port, Peer, StreamID, 0, Yield, Payload) ->
-    case maps:is_key(StreamID, Peer#msp_peer.streams) of
-        true ->
-            io:format("~s:~w may have opened a stream that we already opened. "
-                      "Discarding.~n", [inet:ntoa(IP), Port]),
-            State;
-        false ->
-            StreamListener = Peer#msp_peer.stream_open_listener,
-            erlang:send(StreamListener,
-                        {msp_datagram, IP, Port, StreamID, 0, Yield, Payload}),
-            % TODO: What are we holding onto these datagrams for? To test if
-            % the same ones get send again? To buffer if they arrive out of
-            % order? When all is going to plan all we really need is to know
-            % what level the user has accepted up until.
-            % Maybe when we get things we already know, we should have the
-            % ability to acknowledge, + specify how far back we are even
-            % checking?
-            Datagram = #msp_datagram{index = 0,
-                                     direction = in,
-                                     yield = Yield,
-                                     payload = Payload,
-                                     verified = false},
-            % TODO: Separate the opening notification from the actual flushing,
-            % until an external process explicitly registers to the stream?
-            Stream = #msp_stream{data = [Datagram],
-                                 next_ack_index = 0,
-                                 next_unverified_index = 0,
-                                 next_index = 1,
-                                 has_control = Yield,
-                                 event_listener = StreamListener},
-
-            rebuild_state(State, IP, Port, Peer, StreamID, Stream)
-    end;
 do_handle_datagram2(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
     case maps:find(StreamID, Peer#msp_peer.streams) of
         {ok, Stream} ->
             do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index,
                                 Yield, Payload);
         error ->
-            State
+            do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index,
+                                   Yield, Payload)
     end.
 
 do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Payload) ->
@@ -446,6 +422,7 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
             StreamListener = Stream#msp_stream.event_listener,
             erlang:send(StreamListener, {msp_datagram, IP, Port, StreamID,
                                          Index, Yield, Payload}),
+            % TODO: Why do we even store these datagrams?
             Datagram = #msp_datagram{index = Index,
                                      direction = in,
                                      yield = Yield,
@@ -478,15 +455,80 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
             State
     end.
 
+do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
+    Actual = StreamID rem 2 == 0,
+    % If our streams have to be odd, then we expect their streams to be even,
+    % so we expect StreamID rem 2 to be 0.
+    Expected = Peer#msp_peer.id_pattern == odd,
+    % Check whether their stream is even to whether we expected it to be even.
+    case Actual == Expected of
+        true ->
+            StreamListener = Peer#msp_peer.stream_open_listener,
+            % TODO: What are we holding onto these datagrams for? To test if
+            % the same ones get send again? To buffer if they arrive out of
+            % order? When all is going to plan all we really need is to know
+            % what level the user has accepted up until.
+            % Maybe when we get things we already know, we should have the
+            % ability to acknowledge, + specify how far back we are even
+            % checking?
+            Datagram = #msp_datagram{index = Index,
+                                     direction = in,
+                                     yield = Yield,
+                                     payload = Payload,
+                                     verified = false},
+            % TODO: Separate the opening notification from the actual flushing,
+            % until an external process explicitly registers to the stream?
+            Stream = #msp_stream{data = [Datagram],
+                                 next_ack_index = 0,
+                                 next_unverified_index = 0,
+                                 next_index = 0,
+                                 has_control = false,
+                                 event_listener = StreamListener},
+            Stream2 = send_incoming_packets(IP, Port, StreamID, Stream),
+
+            rebuild_state(State, IP, Port, Peer, StreamID, Stream2);
+        false ->
+            % TODO: Reject the stream.
+            State
+    end.
+
+send_incoming_packets(_IP, _Port, _StreamID, Stream = #msp_stream{has_control = true}) ->
+    % TODO: check that the data buffer is completely empty? since we only just
+    % told the user about some packets, and the peer just yielded, so they
+    % shouldn't have sent more packets after.
+    Stream;
+send_incoming_packets(IP, Port, StreamID, Stream) ->
+    Index = Stream#msp_stream.next_index,
+    case lists:keytake(Index, #msp_datagram.index, Stream#msp_stream.data) of
+        {value, Datagram, Data} ->
+            Yield = Datagram#msp_datagram.yield,
+            Payload = Datagram#msp_datagram.payload,
+            erlang:send(Stream#msp_stream.event_listener,
+                        {msp_datagram, IP, Port, StreamID, Index, Yield, Payload}),
+            % TODO: Stop storing packets we have already passed on to the user
+            NewStream = Stream#msp_stream{data = [Datagram | Data],
+                                          next_index = Index + 1,
+                                          has_control = Yield},
+            send_incoming_packets(IP, Port, StreamID, NewStream);
+        false ->
+            Stream
+    end.
+
 do_accept_packet(State, IP, Port, StreamID, PacketID) ->
     % Trust the process casting to us, for now, and just peel off the layers.
     Peer = maps:get({IP, Port}, State#msp_state.peers),
     Stream = maps:get(StreamID, Peer#msp_peer.streams),
+
+    %case PacketID >= Stream#msp_stream.next_unverified_id of
+        %true ->
+            %NewStream = Stream#msp_stream{next_unverified_id = PacketID + 1},
+
     {value, Datagram, Data} = lists:keytake(PacketID, #msp_datagram.index,
                                             Stream#msp_stream.data),
 
     NewDatagram = Datagram#msp_datagram{verified = true},
     NewData = [NewDatagram | Data],
+
     NewStream = Stream#msp_stream{data = NewData},
 
     NewStream2 = check_ack(State, IP, Port, StreamID, NewStream),
