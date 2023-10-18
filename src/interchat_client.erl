@@ -73,7 +73,10 @@ loop(State = #cs{input_mode = InputMode}) ->
     end.
 
 process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}},
-                 IP, Port, StreamID, _Index, true, "accepted") ->
+                 IP, Port, StreamID, Index, true, "accepted") ->
+    % Accept the packet, since we aren't going to reply. Really they should be
+    % closing the stream, which we would also accept.
+    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
     % TODO: What if they reply but with the wrong yield field/etc? We could
     % detect incorrect replies early and stop waiting immediately.
     erlang:cancel_timer(TRef),
@@ -84,8 +87,12 @@ process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, Us
     NewState = State#cs{servers = Servers, input_mode = normal},
     prompt_and_loop(NewState);
 process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, _Username, TRef}},
-                 IP, Port, StreamID, _Index, true, "taken") ->
+                 IP, Port, StreamID, Index, true, "taken") ->
+    % Accept the packet, while we work out a response.
+    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
+    % Don't time out. TODO: make this msp's responsibility.
     erlang:cancel_timer(TRef),
+    % Try and get a new username.
     io:format("Username taken. Try again.~n", []),
     NewState = State#cs{input_mode = {username, IP, Port, StreamID}},
     prompt_and_loop(NewState);
@@ -101,6 +108,8 @@ process_datagram(State, IP, Port, StreamID, Index, Yield, Data) ->
 
 
 process_datagram2(State, IP, Port, StreamID, 0, false, "messages in " ++ ChannelName, Connection) ->
+    % Accept the packet.
+    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, 0),
     % Add the stream.
     Streams = maps:put(StreamID,
                        ChannelName,
@@ -119,7 +128,7 @@ process_datagram2(State, IP, Port, _StreamID, 0, _Yield, Data, _Connection) ->
 process_datagram2(State, IP, Port, StreamID, Index, Yield, Data, Connection) ->
     case maps:find(StreamID, Connection#server_connection.streams_in) of
         {ok, ChannelName} ->
-            try_display_message(State, IP, Port, ChannelName, Data),
+            try_display_message(State, IP, Port, StreamID, Index, ChannelName, Data),
             % TODO: Print a new '>' prompt if we just overwrote one with \r?
             loop(State);
         error ->
@@ -136,15 +145,21 @@ process_datagram3(State, IP, Port, StreamID, Index, Yield, Data, Connection) ->
             NewState = State#cs{servers = Connections},
             case Data of
                 "successfully joined" ->
+                    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
                     io:format("\rJoined channel ~s.~n", [Channel]),
                     NewState2 = NewState#cs{current_channel = {IP, Port, Channel, none}},
                     % TODO: Print a new '>' prompt if we just overwrote one
                     % with \r?
                     loop(NewState2);
                 "already joined" ->
+                    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
                     io:format("\rAlready in channel ~s.~n", [Channel]),
                     % TODO: Print a new '>' prompt if we just overwrote one
                     % with \r?
+                    loop(NewState);
+                _ ->
+                    % TODO: reject the packet? Close the stream? Give up?
+                    io:format("Could not join channel ~s?~n", [Channel]),
                     loop(NewState)
             end;
         error ->
@@ -199,6 +214,12 @@ parse(State, Str) ->
         {"/join", A} ->
             NewState = join(State, A),
             NewState;
+        {"/msp", ""} ->
+            io:format("MSP state: ~p~n", [msp:state(State#cs.msp_proc)]),
+            State;
+        {"/msp", _} ->
+            io:format("/msp does not take any arguments~n", []),
+            State;
         {[$/ | A] , _} ->
             io:format("Unknown command '/~s'.~n", [A]),
             State;
@@ -332,11 +353,13 @@ help(_) ->
     io:format("/quit - close the client.~n", []),
     ok.
 
-try_display_message(State, IP, Port, ChannelName, Data = "sender: " ++ Rest) ->
+try_display_message(State, IP, Port, StreamID, Index, ChannelName, Data = "sender: " ++ Rest) ->
     case string:split(Rest, ", ts: ") of
         [Sender, Rest2] ->
             case string:to_integer(Rest2) of
                 {TS, ", payload: " ++ Payload} ->
+                    msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID,
+                                      Index),
                     display_message(State, IP, Port, ChannelName, Sender, TS, Payload),
                     ok;
                 {_, _} ->
@@ -345,7 +368,7 @@ try_display_message(State, IP, Port, ChannelName, Data = "sender: " ++ Rest) ->
         _ ->
             message_invalid(IP, Port, ChannelName, Data)
     end;
-try_display_message(_State, IP, Port, ChannelName, Data) ->
+try_display_message(_State, IP, Port, _StreamID, _Index, ChannelName, Data) ->
     message_invalid(IP, Port, ChannelName, Data).
 
 display_message(_State, _IP, _Port, ChannelName, Sender, TS, Payload) ->
@@ -355,6 +378,7 @@ display_message(_State, _IP, _Port, ChannelName, Sender, TS, Payload) ->
     ok.
 
 message_invalid(_IP, _Port, ChannelName, Data) ->
+    % TODO: Reject the packet.
     io:format("\rUnexpected message in stream for channel ~s: ~s~n",
               [ChannelName, Data]).
 

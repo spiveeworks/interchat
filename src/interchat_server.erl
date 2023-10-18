@@ -22,6 +22,7 @@
 start() ->
     register(?MODULE, self()),
     {ok, MSP} = msp:start_link(7777),
+    register(msp, MSP),
     msp:start_listening(MSP, self(), self()),
     io:format("Server started.~n", []),
     loop(#ss{msp_proc = MSP}).
@@ -103,6 +104,9 @@ add_message_upload_stream(State, IP, Port, StreamID, ChannelName, Connection) ->
 add_message_upload_stream2(State, IP, Port, StreamID, ChannelName, Connection, Channel) ->
     case lists:member(Connection#connection.username, Channel#channel.users) of
         true ->
+            % Mark the stream as trusted, since we will be taking each message
+            % as is. TODO: Check they are valid UTF-8, or something?
+            msp:trust_stream(State#ss.msp_proc, IP, Port, StreamID),
             Streams = maps:put(StreamID,
                                ChannelName,
                                Connection#connection.streams_in),

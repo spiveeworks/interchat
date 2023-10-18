@@ -3,7 +3,8 @@
 -behaviour(gen_server).
 
 -export([start_link/1]).
--export([state/1, start_listening/3, connect/4, open_stream/6, append_stream/6]).
+-export([state/1, start_listening/3, connect/4, open_stream/6, append_stream/6,
+         accept_packet/5, reject_packet/5, trust_stream/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 state(PID) ->
@@ -24,16 +25,40 @@ open_stream(PID, IP, Port, HandlerPID, FirstPayload, FirstYield) ->
 append_stream(PID, IP, Port, StreamID, Payload, Yield) ->
     gen_server:call(PID, {append_stream, IP, Port, StreamID, Payload, Yield}).
 
+accept_packet(PID, IP, Port, StreamID, PacketID) ->
+    gen_server:cast(PID, {accept_packet, IP, Port, StreamID, PacketID}).
+
+reject_packet(PID, IP, Port, StreamID, PacketID) ->
+    gen_server:cast(PID, {reject_packet, IP, Port, StreamID, PacketID}).
+
+trust_stream(PID, IP, Port, StreamID) ->
+    gen_server:cast(PID, {trust_stream, IP, Port, StreamID}).
+
+
 -type endpoint() :: {inet:ip_address(), inet:port_number()}.
 
 -record(msp_datagram, {index :: integer(),
+                       direction :: in | out,
                        yield :: boolean(),
                        % TODO: use binaries? IO lists?
-                       payload :: string()}).
+                       payload :: string(),
+                       % If our index is greater than the next unverified
+                       % index, then we need to track verification per-packet.
+                       % This field should be ignored if the stream already
+                       % says we are verified. TODO: Why do we track
+                       % verification per-packet? We could just ask the
+                       % userspace to verify all or nothing.
+                       verified :: boolean()}).
 -record(msp_stream, {data = [] :: [#msp_datagram{}],
+                     % How many packets have we/they acknowledged?
+                     next_ack_index :: integer(),
+                     % How many packets have been verified by userspace?
+                     next_unverified_index :: integer(),
+                     % How many packets have we received overall?
                      next_index :: integer(),
                      has_control :: boolean(),
-                     event_listener :: pid()}).
+                     event_listener :: pid(),
+                     trusted = false :: boolean()}).
 -record(msp_peer, {streams = #{} :: #{integer() => #msp_stream{}},
                    stream_open_listener :: pid()}).
 -record(msp_pending_peer, {address :: endpoint(),
@@ -46,6 +71,16 @@ append_stream(PID, IP, Port, StreamID, Payload, Yield) ->
                     pending_peers = [] :: [#msp_pending_peer{}],
                     peers = #{} :: #{endpoint() => #msp_peer{}},
                     listeners = none :: none | {pid(), pid()}}).
+
+% Typically we need to dig down to the stream in question, modify it, and then
+% build back to our overall state. TODO: Split up this process? Starting to see
+% that deeply nested state is a heuristic in Erlang, that more concurrency is
+% available for the taking... Is it always worth taking? I have little idea.
+rebuild_state(State, IP, Port, Peer, StreamID, Stream) ->
+    NewStreams = maps:put(StreamID, Stream, Peer#msp_peer.streams),
+    NewPeer = Peer#msp_peer{streams = NewStreams},
+    NewPeers = maps:put({IP, Port}, NewPeer, State#msp_state.peers),
+    State#msp_state{peers = NewPeers}.
 
 start_link(Port) ->
     gen_server:start_link(?MODULE, Port, []).
@@ -69,6 +104,15 @@ handle_call({append_stream, IP, Port, StreamID, Payload, Yield}, Caller, State) 
 
 handle_cast({start_listening, ConnectionPID, StreamPID}, State) ->
     NewState = State#msp_state{listeners = {ConnectionPID, StreamPID}},
+    {noreply, NewState};
+handle_cast({accept_packet, IP, Port, StreamID, PacketID}, State) ->
+    NewState = do_accept_packet(State, IP, Port, StreamID, PacketID),
+    {noreply, NewState};
+handle_cast({reject_packet, IP, Port, StreamID, PacketID}, State) ->
+    NewState = do_reject_packet(State, IP, Port, StreamID, PacketID),
+    {noreply, NewState};
+handle_cast({trust_stream, IP, Port, StreamID}, State) ->
+    NewState = do_trust_stream(State, IP, Port, StreamID),
     {noreply, NewState}.
 
 handle_info({udp, Socket, IP, Port, Data}, State = #msp_state{socket = Socket}) ->
@@ -79,6 +123,13 @@ handle_info({timeout, TRef, connect}, State) ->
     NewState = do_connect_timeout(State, TRef),
     {noreply, NewState}.
 
+-define(NO_YIELD, 0).
+-define(YIELD, 1).
+-define(CLOSE, 2).
+-define(REQUEST_CLOSE, 3).
+-define(ACKNOWLEDGE, 4).
+-define(REJECT, 5).
+
 do_receive(State = #msp_state{listeners = none}, IP, Port, "msp connect") ->
     io:format("~s:~w tried to connect. Discarding.~n", [inet:ntoa(IP), Port]),
     State;
@@ -86,10 +137,12 @@ do_receive(State, IP, Port, "msp connect") ->
     do_accept(State, IP, Port);
 do_receive(State, IP, Port, "connection accepted") ->
     do_connection_success(State, IP, Port);
-do_receive(State, IP, Port, [0 | Data]) ->
+do_receive(State, IP, Port, [?NO_YIELD | Data]) ->
     do_receive2(State, IP, Port, false, Data);
-do_receive(State, IP, Port, [1 | Data]) ->
+do_receive(State, IP, Port, [?YIELD | Data]) ->
     do_receive2(State, IP, Port, true, Data);
+do_receive(State, IP, Port, [?ACKNOWLEDGE | Data]) ->
+    do_receive_ack(State, IP, Port, Data);
 do_receive(State, IP, Port, Data) ->
     io:format("~s:~w sent datagram: ~s~n", [inet:ntoa(IP), Port, Data]),
     State.
@@ -107,6 +160,30 @@ do_receive3(State, IP, Port, Yield, StreamID, Data2) ->
         {ok, Index, Payload} ->
             do_handle_datagram(State, IP, Port, StreamID, Index, Yield, Payload);
         error ->
+            State
+    end.
+
+do_receive_ack(State, IP, Port, Data) ->
+    case decode_int(Data) of
+        {ok, StreamID, Data2} ->
+            do_receive_ack2(State, IP, Port, StreamID, Data2);
+        error ->
+            State
+    end.
+
+do_receive_ack2(State, IP, Port, StreamID, Data) ->
+    case decode_int(Data) of
+        {ok, AckIndex, Data2} ->
+            do_receive_ack3(State, IP, Port, StreamID, AckIndex, Data2);
+        error ->
+            State
+    end.
+
+do_receive_ack3(State, IP, Port, StreamID, AckIndex, Data) ->
+    case decode_int(Data) of
+        {ok, NackIndex, ""} ->
+            do_handle_ack(State, IP, Port, StreamID, AckIndex, NackIndex);
+        _ ->
             State
     end.
 
@@ -178,6 +255,7 @@ do_connection_success(State, IP, Port) ->
             erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
 
             OpenListener = Pending#msp_pending_peer.stream_open_listener,
+            % TODO: Should servers default to being trusted? or?
             Peer = #msp_peer{stream_open_listener = OpenListener},
             NewPeers = maps:put({IP, Port}, Peer, State#msp_state.peers),
             State#msp_state{pending_peers = NewPending,
@@ -197,7 +275,9 @@ do_open_stream(State, IP, Port, HandlerPID, FirstPayload, FirstYield, Caller) ->
             StreamID = choose_stream_id(Peer),
             gen_server:reply(Caller, {ok, StreamID}),
 
-            Stream = #msp_stream{next_index = 0,
+            Stream = #msp_stream{next_ack_index = 0,
+                                 next_unverified_index = 0,
+                                 next_index = 0,
                                  has_control = true,
                                  event_listener = HandlerPID},
             % Skip all of the guards of `append_stream`, since we already
@@ -253,25 +333,30 @@ do_append_stream3(State, IP, Port, StreamID, Payload, Yield, Caller, Peer, Strea
 build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
     Index = Stream#msp_stream.next_index,
     Datagram = #msp_datagram{index = Index,
+                             direction = out,
                              yield = Yield,
-                             payload = Payload},
+                             payload = Payload,
+                             verified = true},
     send_datagram(State, IP, Port, StreamID, Datagram),
 
     % Add the tracking info for this new stream.
     Data = [Datagram | Stream#msp_stream.data],
     NewStream = Stream#msp_stream{data = Data,
                                   next_index = Index + 1,
+                                  % Also treat previous packets as verified and
+                                  % acknowledged, since a response implicitly
+                                  % acknowledges the thing it is responding to,
+                                  % and things we are sending do not need us to
+                                  % acknowledge them.
+                                  next_ack_index = Index + 1,
+                                  next_unverified_index = Index + 1,
                                   has_control = not Yield},
-    NewStreams = maps:put(StreamID, NewStream, Peer#msp_peer.streams),
-    NewPeer = Peer#msp_peer{streams = NewStreams},
-    NewPeers = maps:put({IP, Port}, NewPeer, State#msp_state.peers),
-    State#msp_state{peers = NewPeers}.
-
+    rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
 
 send_datagram(State, IP, Port, StreamID, DatagramInfo) ->
     YieldByte = case DatagramInfo#msp_datagram.yield of
-                    true  -> 1;
-                    false -> 0
+                    true  -> ?YIELD;
+                    false -> ?NO_YIELD
                 end,
     Data = [YieldByte,
             encode_int(StreamID),
@@ -320,18 +405,30 @@ do_handle_datagram2(State, IP, Port, Peer, StreamID, 0, Yield, Payload) ->
             State;
         false ->
             StreamListener = Peer#msp_peer.stream_open_listener,
-            erlang:send(StreamListener, {msp_datagram, IP, Port, StreamID, 0,
-                                         Yield, Payload}),
+            erlang:send(StreamListener,
+                        {msp_datagram, IP, Port, StreamID, 0, Yield, Payload}),
+            % TODO: What are we holding onto these datagrams for? To test if
+            % the same ones get send again? To buffer if they arrive out of
+            % order? When all is going to plan all we really need is to know
+            % what level the user has accepted up until.
+            % Maybe when we get things we already know, we should have the
+            % ability to acknowledge, + specify how far back we are even
+            % checking?
+            Datagram = #msp_datagram{index = 0,
+                                     direction = in,
+                                     yield = Yield,
+                                     payload = Payload,
+                                     verified = false},
             % TODO: Separate the opening notification from the actual flushing,
             % until an external process explicitly registers to the stream?
-            Stream = #msp_stream{next_index = 1,
+            Stream = #msp_stream{data = [Datagram],
+                                 next_ack_index = 0,
+                                 next_unverified_index = 0,
+                                 next_index = 1,
                                  has_control = Yield,
                                  event_listener = StreamListener},
 
-            NewStreams = maps:put(StreamID, Stream, Peer#msp_peer.streams),
-            NewPeer = Peer#msp_peer{streams = NewStreams},
-            NewPeers = maps:put({IP, Port}, NewPeer, State#msp_state.peers),
-            State#msp_state{peers = NewPeers}
+            rebuild_state(State, IP, Port, Peer, StreamID, Stream)
     end;
 do_handle_datagram2(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
     case maps:find(StreamID, Peer#msp_peer.streams) of
@@ -349,14 +446,190 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
             StreamListener = Stream#msp_stream.event_listener,
             erlang:send(StreamListener, {msp_datagram, IP, Port, StreamID,
                                          Index, Yield, Payload}),
+            Datagram = #msp_datagram{index = Index,
+                                     direction = in,
+                                     yield = Yield,
+                                     payload = Payload,
+                                     verified = Stream#msp_stream.trusted},
 
-            NewStream = Stream#msp_stream{next_index = Index + 1,
+            Data = [Datagram | Stream#msp_stream.data],
+
+            NextUnverified = case Stream#msp_stream.trusted of
+                                 true  -> Index + 1;
+                                 false -> Stream#msp_stream.next_unverified_index
+                             end,
+            NewStream = Stream#msp_stream{data = Data,
+                                          next_index = Index + 1,
+                                          next_unverified_index = NextUnverified,
                                           has_control = Yield},
-            NewStreams = maps:put(StreamID, NewStream, Peer#msp_peer.streams),
-            NewPeer = Peer#msp_peer{streams = NewStreams},
-            NewPeers = maps:put({IP, Port}, NewPeer, State#msp_state.peers),
-            State#msp_state{peers = NewPeers};
+            % If the stream is trusted, then we might be able to ACK right now.
+            NewStream2 = send_ack_if_any(State#msp_state.socket, IP, Port,
+                                         StreamID, NewStream),
+            % the fact that we got a reply means anything we sent was also
+            % acknowledged, so we should treat those packets like they were
+            % acknowledged, which means removing them. We will remove anything
+            % we sent, and anything we have verified, since that is the height
+            % we actually store.
+            NewStream3 = remove_acknowledged_packets(NewStream2, NextUnverified - 1),
+            % TODO: Notify user that things were implicitly acknowledged?
+
+            rebuild_state(State, IP, Port, Peer, StreamID, NewStream3);
         false ->
             State
     end.
+
+do_accept_packet(State, IP, Port, StreamID, PacketID) ->
+    % Trust the process casting to us, for now, and just peel off the layers.
+    Peer = maps:get({IP, Port}, State#msp_state.peers),
+    Stream = maps:get(StreamID, Peer#msp_peer.streams),
+    {value, Datagram, Data} = lists:keytake(PacketID, #msp_datagram.index,
+                                            Stream#msp_stream.data),
+
+    NewDatagram = Datagram#msp_datagram{verified = true},
+    NewData = [NewDatagram | Data],
+    NewStream = Stream#msp_stream{data = NewData},
+
+    NewStream2 = check_ack(State, IP, Port, StreamID, NewStream),
+    rebuild_state(State, IP, Port, Peer, StreamID, NewStream2).
+
+check_ack(State, IP, Port, StreamID, Stream) ->
+    {NewStream, Status} = update_verified_count(Stream),
+    case Status of
+        % If we had a reply prepared, we would have verified the received
+        % packets by a different path, and already sent or planned to send the
+        % reply AS the ACK. Since there is no reply prepared, we should ACK
+        % what we have gotten, if anything. TODO: wait until our mailbox is
+        % empty, to see if there was a reply there?
+        yielded    -> send_ack_if_any(State#msp_state.socket, IP, Port,
+                                      StreamID, NewStream);
+
+        % We have stuff we have already received, that user code might still
+        % accept/reject, wait for that before we give feedback... Unless they
+        % are sending so much stuff, that we should acknowledge what we have so
+        % far, just so they know they are streaming successfully. TODO: wait
+        % until out mailbox is empty, to see if more things were verified? Or,
+        % if not empty, until the next mailbox tic?
+        unverified -> send_ack_if_backlogged(State#msp_state.socket, IP, Port,
+                                             StreamID, NewStream);
+
+        % We have verified everything that we have received, ack
+        % what we have gotten. TODO: wait until our mailbox is
+        % empty, to see if we have received more already?
+        missing    -> send_ack_if_any(State#msp_state.socket, IP, Port,
+                                      StreamID, NewStream)
+    end.
+
+update_verified_count(Stream) ->
+    NextUnverified = Stream#msp_stream.next_unverified_index,
+    case lists:keyfind(NextUnverified, #msp_datagram.index, Stream#msp_stream.data) of
+        #msp_datagram{direction = in, verified = true, yield = Yield} ->
+            NewStream = Stream#msp_stream{next_unverified_index = NextUnverified + 1},
+            case Yield of
+                true ->
+                    {NewStream, yielded};
+                false ->
+                    update_verified_count(NewStream)
+            end;
+        #msp_datagram{direction = in, verified = false} ->
+            {Stream, unverified};
+        #msp_datagram{direction = out} ->
+            io:format("Warning: got verified but unyielding packets, followed "
+                      "by a reply?~n"),
+            {Stream, yielded};
+        false ->
+            {Stream, missing}
+    end.
+
+send_ack_if_any(Socket, IP, Port, StreamID, Stream) ->
+    Ack = Stream#msp_stream.next_ack_index - 1,
+    Verified = Stream#msp_stream.next_unverified_index - 1,
+    case Verified > Ack of
+        true ->
+            Verified = Stream#msp_stream.next_unverified_index - 1,
+            % TODO: Are there security considerations in regards to exposing
+            % our ability to keep up with the stream? Should we just verify
+            % multiples of 10 or whatever?
+            send_ack(Socket, IP, Port, StreamID, Verified),
+            Stream#msp_stream{next_ack_index = Verified + 1};
+        false ->
+            Stream
+    end.
+
+send_ack_if_backlogged(Socket, IP, Port, StreamID, Stream) ->
+    Ack = Stream#msp_stream.next_ack_index - 1,
+    Verified = Stream#msp_stream.next_unverified_index - 1,
+    case Verified > Ack + 10 of
+        true ->
+            Verified = Stream#msp_stream.next_unverified_index - 1,
+            % TODO: Are there security considerations in regards to exposing
+            % our ability to keep up with the stream? Should we just verify
+            % multiples of 10 or whatever?
+            send_ack(Socket, IP, Port, StreamID, Verified),
+            Stream#msp_stream{next_ack_index = Verified + 1};
+        false ->
+            Stream
+    end.
+
+send_ack(Socket, IP, Port, StreamID, AckIndex) ->
+    Data = [?ACKNOWLEDGE,
+            encode_int(StreamID),
+            encode_int(AckIndex),
+            % If this is greater than AckIndex + 1, then it indicates a NACK
+            % for all the packets in between. TODO: Actually calculate how much
+            % to NACK.
+            encode_int(0)],
+    ok = gen_udp:send(Socket, IP, Port, Data),
+    ok.
+
+do_reject_packet(State, _IP, _Port, _StreamID, _PacketID) ->
+    io:format("Warning: Packet rejection is not yet implemented.~n", []),
+    State.
+
+do_trust_stream(State, IP, Port, StreamID) ->
+    Peer = maps:get({IP, Port}, State#msp_state.peers),
+    Stream = maps:get(StreamID, Peer#msp_peer.streams),
+
+    % Mark the stream as trusted, and mark any packets we have already received
+    % as verified.
+    NewStream = Stream#msp_stream{next_unverified_index = Stream#msp_stream.next_index,
+                                  trusted = true},
+    % Acknowledge anything that we have already been sent, now that it is all
+    % trusted.
+    NewStream2 = send_ack_if_any(State#msp_state.socket, IP, Port, StreamID,
+                                 NewStream),
+
+    rebuild_state(State, IP, Port, Peer, StreamID, NewStream2).
+
+do_handle_ack(State, IP, Port, StreamID, AckIndex, NackIndex) ->
+    case maps:find({IP, Port}, State#msp_state.peers) of
+        {ok, Peer} ->
+            do_handle_ack2(State, IP, Port, Peer, StreamID, AckIndex,
+                           NackIndex);
+        error ->
+            State
+    end.
+
+do_handle_ack2(State, IP, Port, Peer, StreamID, AckIndex, NackIndex) ->
+    case maps:find(StreamID, Peer#msp_peer.streams) of
+        {ok, Stream} ->
+            do_handle_ack3(State, IP, Port, Peer, StreamID, Stream, AckIndex,
+                           NackIndex);
+        error ->
+            State
+    end.
+
+do_handle_ack3(State, IP, Port, Peer, StreamID, Stream, AckIndex, _NackIndex) ->
+    NewStream = remove_acknowledged_packets(Stream, AckIndex),
+
+    % TODO: Notify stream event listener that the packets were accepted.
+
+    rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
+
+remove_acknowledged_packets(Stream, AckIndex) ->
+    F = fun(#msp_datagram{index = Index}) ->
+                Index > AckIndex
+        end,
+    Data = lists:filter(F, Stream#msp_stream.data),
+
+    Stream#msp_stream{data = Data}.
 
