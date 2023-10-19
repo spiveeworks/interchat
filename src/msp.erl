@@ -41,14 +41,7 @@ trust_stream(PID, IP, Port, StreamID) ->
                        direction :: in | out,
                        yield :: boolean(),
                        % TODO: use binaries? IO lists?
-                       payload :: string(),
-                       % If our index is greater than the next unverified
-                       % index, then we need to track verification per-packet.
-                       % This field should be ignored if the stream already
-                       % says we are verified. TODO: Why do we track
-                       % verification per-packet? We could just ask the
-                       % userspace to verify all or nothing.
-                       verified :: boolean()}).
+                       payload :: string()}).
 -record(msp_stream, {data = [] :: [#msp_datagram{}],
                      % How many packets have we/they acknowledged?
                      next_ack_index :: integer(),
@@ -343,8 +336,7 @@ build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
     Datagram = #msp_datagram{index = Index,
                              direction = out,
                              yield = Yield,
-                             payload = Payload,
-                             verified = true},
+                             payload = Payload},
     send_datagram(State, IP, Port, StreamID, Datagram),
 
     % Add the tracking info for this new stream.
@@ -422,21 +414,12 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
             StreamListener = Stream#msp_stream.event_listener,
             erlang:send(StreamListener, {msp_datagram, IP, Port, StreamID,
                                          Index, Yield, Payload}),
-            % TODO: Why do we even store these datagrams?
-            Datagram = #msp_datagram{index = Index,
-                                     direction = in,
-                                     yield = Yield,
-                                     payload = Payload,
-                                     verified = Stream#msp_stream.trusted},
-
-            Data = [Datagram | Stream#msp_stream.data],
 
             NextUnverified = case Stream#msp_stream.trusted of
                                  true  -> Index + 1;
                                  false -> Stream#msp_stream.next_unverified_index
                              end,
-            NewStream = Stream#msp_stream{data = Data,
-                                          next_index = Index + 1,
+            NewStream = Stream#msp_stream{next_index = Index + 1,
                                           next_unverified_index = NextUnverified,
                                           has_control = Yield},
             % If the stream is trusted, then we might be able to ACK right now.
@@ -447,7 +430,8 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
             % acknowledged, which means removing them. We will remove anything
             % we sent, and anything we have verified, since that is the height
             % we actually store.
-            NewStream3 = remove_acknowledged_packets(NewStream2, NextUnverified - 1),
+            io:format("(Handling Implicit Ack)~n", []),
+            NewStream3 = remove_acknowledged_packets(NewStream2, Index),
             % TODO: Notify user that things were implicitly acknowledged?
 
             rebuild_state(State, IP, Port, Peer, StreamID, NewStream3);
@@ -464,18 +448,10 @@ do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) -
     case Actual == Expected of
         true ->
             StreamListener = Peer#msp_peer.stream_open_listener,
-            % TODO: What are we holding onto these datagrams for? To test if
-            % the same ones get send again? To buffer if they arrive out of
-            % order? When all is going to plan all we really need is to know
-            % what level the user has accepted up until.
-            % Maybe when we get things we already know, we should have the
-            % ability to acknowledge, + specify how far back we are even
-            % checking?
             Datagram = #msp_datagram{index = Index,
                                      direction = in,
                                      yield = Yield,
-                                     payload = Payload,
-                                     verified = false},
+                                     payload = Payload},
             % TODO: Separate the opening notification from the actual flushing,
             % until an external process explicitly registers to the stream?
             Stream = #msp_stream{data = [Datagram],
@@ -506,7 +482,7 @@ send_incoming_packets(IP, Port, StreamID, Stream) ->
             erlang:send(Stream#msp_stream.event_listener,
                         {msp_datagram, IP, Port, StreamID, Index, Yield, Payload}),
             % TODO: Stop storing packets we have already passed on to the user
-            NewStream = Stream#msp_stream{data = [Datagram | Data],
+            NewStream = Stream#msp_stream{data = Data,
                                           next_index = Index + 1,
                                           has_control = Yield},
             send_incoming_packets(IP, Port, StreamID, NewStream);
@@ -519,67 +495,46 @@ do_accept_packet(State, IP, Port, StreamID, PacketID) ->
     Peer = maps:get({IP, Port}, State#msp_state.peers),
     Stream = maps:get(StreamID, Peer#msp_peer.streams),
 
-    %case PacketID >= Stream#msp_stream.next_unverified_id of
-        %true ->
-            %NewStream = Stream#msp_stream{next_unverified_id = PacketID + 1},
+    case PacketID >= Stream#msp_stream.next_unverified_index of
+        true ->
+            io:format("Verifying some packets. Had verified ~p, now verified ~p.~n",
+                      [Stream#msp_stream.next_unverified_index - 1,
+                       PacketID]),
+            % Mark more packets as verified, and potentially acknowledge them.
+            NewStream = Stream#msp_stream{next_unverified_index = PacketID + 1},
 
-    {value, Datagram, Data} = lists:keytake(PacketID, #msp_datagram.index,
-                                            Stream#msp_stream.data),
-
-    NewDatagram = Datagram#msp_datagram{verified = true},
-    NewData = [NewDatagram | Data],
-
-    NewStream = Stream#msp_stream{data = NewData},
-
-    NewStream2 = check_ack(State, IP, Port, StreamID, NewStream),
-    rebuild_state(State, IP, Port, Peer, StreamID, NewStream2).
+            NewStream2 = check_ack(State, IP, Port, StreamID, NewStream),
+            rebuild_state(State, IP, Port, Peer, StreamID, NewStream2);
+        false ->
+            io:format("Already verified that.~n", []),
+            % Already verified, do nothing.
+            State
+    end.
 
 check_ack(State, IP, Port, StreamID, Stream) ->
-    {NewStream, Status} = update_verified_count(Stream),
-    case Status of
-        % If we had a reply prepared, we would have verified the received
-        % packets by a different path, and already sent or planned to send the
-        % reply AS the ACK. Since there is no reply prepared, we should ACK
-        % what we have gotten, if anything. TODO: wait until our mailbox is
-        % empty, to see if there was a reply there?
-        yielded    -> send_ack_if_any(State#msp_state.socket, IP, Port,
-                                      StreamID, NewStream);
-
+    case Stream#msp_stream.next_unverified_index < Stream#msp_stream.next_index of
         % We have stuff we have already received, that user code might still
         % accept/reject, wait for that before we give feedback... Unless they
         % are sending so much stuff, that we should acknowledge what we have so
         % far, just so they know they are streaming successfully. TODO: wait
-        % until out mailbox is empty, to see if more things were verified? Or,
+        % until our mailbox is empty, to see if more things were verified? Or,
         % if not empty, until the next mailbox tic?
-        unverified -> send_ack_if_backlogged(State#msp_state.socket, IP, Port,
-                                             StreamID, NewStream);
+        % TODO: If the user doesn't get around to verifying some packets,
+        % should we acknowledge what they *have* verified? Time out and reject
+        % by default? Dunno...
+        true  -> send_ack_if_backlogged(State#msp_state.socket, IP, Port,
+                                        StreamID, Stream);
 
-        % We have verified everything that we have received, ack
-        % what we have gotten. TODO: wait until our mailbox is
-        % empty, to see if we have received more already?
-        missing    -> send_ack_if_any(State#msp_state.socket, IP, Port,
-                                      StreamID, NewStream)
-    end.
-
-update_verified_count(Stream) ->
-    NextUnverified = Stream#msp_stream.next_unverified_index,
-    case lists:keyfind(NextUnverified, #msp_datagram.index, Stream#msp_stream.data) of
-        #msp_datagram{direction = in, verified = true, yield = Yield} ->
-            NewStream = Stream#msp_stream{next_unverified_index = NextUnverified + 1},
-            case Yield of
-                true ->
-                    {NewStream, yielded};
-                false ->
-                    update_verified_count(NewStream)
-            end;
-        #msp_datagram{direction = in, verified = false} ->
-            {Stream, unverified};
-        #msp_datagram{direction = out} ->
-            io:format("Warning: got verified but unyielding packets, followed "
-                      "by a reply?~n"),
-            {Stream, yielded};
-        false ->
-            {Stream, missing}
+        % Either we are waiting on more from the peer, or we are waiting on a
+        % reply from the user. If we had a reply prepared, we would have
+        % verified the received packets by a different path, and already sent
+        % or planned to send the reply AS the ACK. Since there is no reply
+        % prepared, and no more packets left for the user to verify, we should
+        % ACK what we have gotten, if anything. TODO: wait until our mailbox is
+        % empty, to see if there was more from the peer, and/or a reply from
+        % the user, and/or more from the peer?
+        false -> send_ack_if_any(State#msp_state.socket, IP, Port, StreamID,
+                                   Stream)
     end.
 
 send_ack_if_any(Socket, IP, Port, StreamID, Stream) ->
@@ -587,13 +542,12 @@ send_ack_if_any(Socket, IP, Port, StreamID, Stream) ->
     Verified = Stream#msp_stream.next_unverified_index - 1,
     case Verified > Ack of
         true ->
+            io:format("Sending ack to peer.~n", []),
             Verified = Stream#msp_stream.next_unverified_index - 1,
-            % TODO: Are there security considerations in regards to exposing
-            % our ability to keep up with the stream? Should we just verify
-            % multiples of 10 or whatever?
             send_ack(Socket, IP, Port, StreamID, Verified),
             Stream#msp_stream{next_ack_index = Verified + 1};
         false ->
+            io:format("Nothing to ack.~n", []),
             Stream
     end.
 
@@ -668,8 +622,17 @@ do_handle_ack3(State, IP, Port, Peer, StreamID, Stream, AckIndex, _NackIndex) ->
     rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
 
 remove_acknowledged_packets(Stream, AckIndex) ->
+    io:format("Got ack: ~p~n", [AckIndex]),
     F = fun(#msp_datagram{index = Index}) ->
-                Index > AckIndex
+                % Index > AckIndex
+                case Index > AckIndex of
+                    true ->
+                        io:format("Keeping index ~p~n", [Index]),
+                        true;
+                    false ->
+                        io:format("Discarding index ~p~n", [Index]),
+                        false
+                end
         end,
     Data = lists:filter(F, Stream#msp_stream.data),
 
