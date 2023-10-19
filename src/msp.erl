@@ -408,36 +408,44 @@ do_handle_datagram2(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
     end.
 
 do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Payload) ->
-    Expected = Stream#msp_stream.next_index,
-    case (Index == Expected) and not Stream#msp_stream.has_control of
+    Next = Stream#msp_stream.next_index,
+    case (Index >= Next) and not Stream#msp_stream.has_control of
         true ->
-            StreamListener = Stream#msp_stream.event_listener,
-            erlang:send(StreamListener, {msp_datagram, IP, Port, StreamID,
-                                         Index, Yield, Payload}),
+            case lists:keymember(Index, #msp_datagram.index, Stream#msp_stream.data) of
+                false ->
+                    % the fact that we got a reply means anything we sent was also
+                    % acknowledged, so we should treat those packets like they were
+                    % acknowledged, which means removing them.
+                    NewStream = remove_all_outgoing_packets(Stream),
 
-            NextUnverified = case Stream#msp_stream.trusted of
-                                 true  -> Index + 1;
-                                 false -> Stream#msp_stream.next_unverified_index
-                             end,
-            NewStream = Stream#msp_stream{next_index = Index + 1,
-                                          next_unverified_index = NextUnverified,
-                                          has_control = Yield},
-            % If the stream is trusted, then we might be able to ACK right now.
-            NewStream2 = send_ack_if_any(State#msp_state.socket, IP, Port,
-                                         StreamID, NewStream),
-            % the fact that we got a reply means anything we sent was also
-            % acknowledged, so we should treat those packets like they were
-            % acknowledged, which means removing them. We will remove anything
-            % we sent, and anything we have verified, since that is the height
-            % we actually store.
-            io:format("(Handling Implicit Ack)~n", []),
-            NewStream3 = remove_acknowledged_packets(NewStream2, Index),
-            % TODO: Notify user that things were implicitly acknowledged?
+                    Datagram = #msp_datagram{index = Index,
+                                             direction = in,
+                                             yield = Yield,
+                                             payload = Payload},
+                    Data = [Datagram | NewStream#msp_stream.data],
+                    NewStream2 = NewStream#msp_stream{data = Data},
+                    NewStream3 = send_incoming_packets(IP, Port, StreamID, NewStream2),
 
-            rebuild_state(State, IP, Port, Peer, StreamID, NewStream3);
+                    % If the stream is trusted, then we might be able to ACK
+                    % right now.
+                    NewStream4 = send_ack_if_any(State#msp_state.socket, IP,
+                                                 Port, StreamID, NewStream3),
+
+                    rebuild_state(State, IP, Port, Peer, StreamID, NewStream4);
+                true ->
+                    % TODO: Reject the stream.
+                    State
+            end;
         false ->
+            % TODO: Reject the stream? Acknowledge the packet again?
             State
     end.
+
+-ifdef(comment).
+f() ->
+            % TODO: Notify user that things were implicitly acknowledged?
+            ok.
+-endif.
 
 do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
     Actual = StreamID rem 2 == 0,
@@ -481,9 +489,13 @@ send_incoming_packets(IP, Port, StreamID, Stream) ->
             Payload = Datagram#msp_datagram.payload,
             erlang:send(Stream#msp_stream.event_listener,
                         {msp_datagram, IP, Port, StreamID, Index, Yield, Payload}),
-            % TODO: Stop storing packets we have already passed on to the user
+            NextUnverified = case Stream#msp_stream.trusted of
+                                 true  -> Index + 1;
+                                 false -> Stream#msp_stream.next_unverified_index
+                             end,
             NewStream = Stream#msp_stream{data = Data,
                                           next_index = Index + 1,
+                                          next_unverified_index = NextUnverified,
                                           has_control = Yield},
             send_incoming_packets(IP, Port, StreamID, NewStream);
         false ->
@@ -497,16 +509,12 @@ do_accept_packet(State, IP, Port, StreamID, PacketID) ->
 
     case PacketID >= Stream#msp_stream.next_unverified_index of
         true ->
-            io:format("Verifying some packets. Had verified ~p, now verified ~p.~n",
-                      [Stream#msp_stream.next_unverified_index - 1,
-                       PacketID]),
             % Mark more packets as verified, and potentially acknowledge them.
             NewStream = Stream#msp_stream{next_unverified_index = PacketID + 1},
 
             NewStream2 = check_ack(State, IP, Port, StreamID, NewStream),
             rebuild_state(State, IP, Port, Peer, StreamID, NewStream2);
         false ->
-            io:format("Already verified that.~n", []),
             % Already verified, do nothing.
             State
     end.
@@ -542,12 +550,10 @@ send_ack_if_any(Socket, IP, Port, StreamID, Stream) ->
     Verified = Stream#msp_stream.next_unverified_index - 1,
     case Verified > Ack of
         true ->
-            io:format("Sending ack to peer.~n", []),
             Verified = Stream#msp_stream.next_unverified_index - 1,
             send_ack(Socket, IP, Port, StreamID, Verified),
             Stream#msp_stream{next_ack_index = Verified + 1};
         false ->
-            io:format("Nothing to ack.~n", []),
             Stream
     end.
 
@@ -621,18 +627,17 @@ do_handle_ack3(State, IP, Port, Peer, StreamID, Stream, AckIndex, _NackIndex) ->
 
     rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
 
+remove_all_outgoing_packets(Stream) ->
+    F = fun(#msp_datagram{direction = Direction}) ->
+                Direction /= out
+        end,
+    Data = lists:filter(F, Stream#msp_stream.data),
+
+    Stream#msp_stream{data = Data}.
+
 remove_acknowledged_packets(Stream, AckIndex) ->
-    io:format("Got ack: ~p~n", [AckIndex]),
     F = fun(#msp_datagram{index = Index}) ->
-                % Index > AckIndex
-                case Index > AckIndex of
-                    true ->
-                        io:format("Keeping index ~p~n", [Index]),
-                        true;
-                    false ->
-                        io:format("Discarding index ~p~n", [Index]),
-                        false
-                end
+                Index > AckIndex
         end,
     Data = lists:filter(F, Stream#msp_stream.data),
 
