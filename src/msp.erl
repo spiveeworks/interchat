@@ -39,7 +39,7 @@ trust_stream(PID, IP, Port, StreamID) ->
 
 -record(msp_datagram, {index :: integer(),
                        direction :: in | out,
-                       yield :: boolean(),
+                       mode :: yield | hold | close,
                        % TODO: use binaries? IO lists?
                        payload :: string()}).
 -record(msp_stream, {data = [] :: [#msp_datagram{}],
@@ -49,7 +49,7 @@ trust_stream(PID, IP, Port, StreamID) ->
                      next_unverified_index :: integer(),
                      % How many packets have we received overall?
                      next_index :: integer(),
-                     has_control :: boolean(),
+                     mode :: us | them | closed,
                      event_listener :: pid(),
                      trusted = false :: boolean()}).
 -record(msp_peer, {streams = #{} :: #{integer() => #msp_stream{}},
@@ -132,9 +132,11 @@ do_receive(State, IP, Port, "msp connect") ->
 do_receive(State, IP, Port, "connection accepted") ->
     do_connection_success(State, IP, Port);
 do_receive(State, IP, Port, [?NO_YIELD | Data]) ->
-    do_receive2(State, IP, Port, false, Data);
+    do_receive2(State, IP, Port, hold, Data);
 do_receive(State, IP, Port, [?YIELD | Data]) ->
-    do_receive2(State, IP, Port, true, Data);
+    do_receive2(State, IP, Port, yield, Data);
+do_receive(State, IP, Port, [?CLOSE | Data]) ->
+    do_receive2(State, IP, Port, close, Data);
 do_receive(State, IP, Port, [?ACKNOWLEDGE | Data]) ->
     do_receive_ack(State, IP, Port, Data);
 do_receive(State, IP, Port, Data) ->
@@ -278,7 +280,7 @@ do_open_stream(State, IP, Port, HandlerPID, FirstPayload, FirstYield, Caller) ->
             Stream = #msp_stream{next_ack_index = 0,
                                  next_unverified_index = 0,
                                  next_index = 0,
-                                 has_control = true,
+                                 mode = us,
                                  event_listener = HandlerPID},
             % Skip all of the guards of `append_stream`, since we already
             % passed or constructed the cases ourselves, just send the datagram
@@ -322,8 +324,11 @@ do_append_stream2(State, IP, Port, StreamID, Payload, Yield, Caller, Peer) ->
             State
     end.
 
-do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{has_control = false}) ->
+do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{mode = them}) ->
     gen_server:reply(Caller, {error, not_our_turn}),
+    State;
+do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{mode = closed}) ->
+    gen_server:reply(Caller, {error, stream_closed}),
     State;
 do_append_stream3(State, IP, Port, StreamID, Payload, Yield, Caller, Peer, Stream) ->
     Index = Stream#msp_stream.next_index,
@@ -335,12 +340,17 @@ build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
     Index = Stream#msp_stream.next_index,
     Datagram = #msp_datagram{index = Index,
                              direction = out,
-                             yield = Yield,
+                             mode = Yield,
                              payload = Payload},
     send_datagram(State, IP, Port, StreamID, Datagram),
 
     % Add the tracking info for this new stream.
     Data = [Datagram | Stream#msp_stream.data],
+    NewMode = case Yield of
+                  yield -> them;
+                  hold -> us;
+                  close -> closed
+              end,
     NewStream = Stream#msp_stream{data = Data,
                                   next_index = Index + 1,
                                   % Also treat previous packets as verified and
@@ -350,13 +360,14 @@ build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
                                   % acknowledge them.
                                   next_ack_index = Index + 1,
                                   next_unverified_index = Index + 1,
-                                  has_control = not Yield},
+                                  mode = NewMode},
     rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
 
 send_datagram(State, IP, Port, StreamID, DatagramInfo) ->
-    YieldByte = case DatagramInfo#msp_datagram.yield of
-                    true  -> ?YIELD;
-                    false -> ?NO_YIELD
+    YieldByte = case DatagramInfo#msp_datagram.mode of
+                    yield  -> ?YIELD;
+                    hold -> ?NO_YIELD;
+                    close -> ?CLOSE
                 end,
     Data = [YieldByte,
             encode_int(StreamID),
@@ -409,8 +420,8 @@ do_handle_datagram2(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
 
 do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Payload) ->
     Next = Stream#msp_stream.next_index,
-    case (Index >= Next) and not Stream#msp_stream.has_control of
-        true ->
+    case Stream#msp_stream.mode of
+        them when Index >= Next ->
             case lists:keymember(Index, #msp_datagram.index, Stream#msp_stream.data) of
                 false ->
                     % the fact that we got a reply means anything we sent was also
@@ -420,7 +431,7 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
 
                     Datagram = #msp_datagram{index = Index,
                                              direction = in,
-                                             yield = Yield,
+                                             mode = Yield,
                                              payload = Payload},
                     Data = [Datagram | NewStream#msp_stream.data],
                     NewStream2 = NewStream#msp_stream{data = Data},
@@ -436,8 +447,11 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
                     % TODO: Reject the stream.
                     State
             end;
-        false ->
-            % TODO: Reject the stream? Acknowledge the packet again?
+        _ when Index < Next ->
+            % TODO: Acknowledge the packet again?
+            State;
+        _ ->
+            % TODO: Reject the stream?
             State
     end.
 
@@ -458,7 +472,7 @@ do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) -
             StreamListener = Peer#msp_peer.stream_open_listener,
             Datagram = #msp_datagram{index = Index,
                                      direction = in,
-                                     yield = Yield,
+                                     mode = Yield,
                                      payload = Payload},
             % TODO: Separate the opening notification from the actual flushing,
             % until an external process explicitly registers to the stream?
@@ -466,7 +480,7 @@ do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) -
                                  next_ack_index = 0,
                                  next_unverified_index = 0,
                                  next_index = 0,
-                                 has_control = false,
+                                 mode = them,
                                  event_listener = StreamListener},
             Stream2 = send_incoming_packets(IP, Port, StreamID, Stream),
 
@@ -476,7 +490,7 @@ do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) -
             State
     end.
 
-send_incoming_packets(_IP, _Port, _StreamID, Stream = #msp_stream{has_control = true}) ->
+send_incoming_packets(_IP, _Port, _StreamID, Stream = #msp_stream{mode = Mode}) when Mode /= them ->
     % TODO: check that the data buffer is completely empty? since we only just
     % told the user about some packets, and the peer just yielded, so they
     % shouldn't have sent more packets after.
@@ -485,7 +499,7 @@ send_incoming_packets(IP, Port, StreamID, Stream) ->
     Index = Stream#msp_stream.next_index,
     case lists:keytake(Index, #msp_datagram.index, Stream#msp_stream.data) of
         {value, Datagram, Data} ->
-            Yield = Datagram#msp_datagram.yield,
+            Yield = Datagram#msp_datagram.mode,
             Payload = Datagram#msp_datagram.payload,
             erlang:send(Stream#msp_stream.event_listener,
                         {msp_datagram, IP, Port, StreamID, Index, Yield, Payload}),
@@ -493,10 +507,15 @@ send_incoming_packets(IP, Port, StreamID, Stream) ->
                                  true  -> Index + 1;
                                  false -> Stream#msp_stream.next_unverified_index
                              end,
+            NewMode = case Yield of
+                          yield -> us;
+                          hold -> them;
+                          close -> closed
+                      end,
             NewStream = Stream#msp_stream{data = Data,
                                           next_index = Index + 1,
                                           next_unverified_index = NextUnverified,
-                                          has_control = Yield},
+                                          mode = NewMode},
             send_incoming_packets(IP, Port, StreamID, NewStream);
         false ->
             Stream

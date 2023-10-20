@@ -73,7 +73,7 @@ loop(State = #cs{input_mode = InputMode}) ->
     end.
 
 process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, Username, TRef}},
-                 IP, Port, StreamID, Index, true, "accepted") ->
+                 IP, Port, StreamID, Index, close, "accepted") ->
     % Accept the packet, since we aren't going to reply. Really they should be
     % closing the stream, which we would also accept.
     msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
@@ -87,7 +87,7 @@ process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, Us
     NewState = State#cs{servers = Servers, input_mode = normal},
     prompt_and_loop(NewState);
 process_datagram(State = #cs{input_mode = {send_username, IP, Port, StreamID, _Username, TRef}},
-                 IP, Port, StreamID, Index, true, "taken") ->
+                 IP, Port, StreamID, Index, yield, "taken") ->
     % Accept the packet, while we work out a response.
     msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, Index),
     % Don't time out. TODO: make this msp's responsibility.
@@ -107,7 +107,7 @@ process_datagram(State, IP, Port, StreamID, Index, Yield, Data) ->
     end.
 
 
-process_datagram2(State, IP, Port, StreamID, 0, false, "messages in " ++ ChannelName, Connection) ->
+process_datagram2(State, IP, Port, StreamID, 0, hold, "messages in " ++ ChannelName, Connection) ->
     % Accept the packet.
     msp:accept_packet(State#cs.msp_proc, IP, Port, StreamID, 0),
     % Add the stream.
@@ -167,8 +167,9 @@ process_datagram3(State, IP, Port, StreamID, Index, Yield, Data, Connection) ->
             % TODO: Move log_datagram from interchat_server to msp, and use it
             % here as well?
             YieldStr = case Yield of
-                           true  -> "(yield)";
-                           false -> "(...)"
+                           yield  -> "(yield)";
+                           hold -> "(...)";
+                           close -> "(close)"
                        end,
             io:format("\r~s:~w sent unexpected packet ~p.~p: ~s ~s~n",
                       [inet:ntoa(IP), Port, StreamID, Index, Data, YieldStr]),
@@ -238,7 +239,7 @@ send_message(State, IP, Port, Channel, none, Str) ->
     % TODO: Make this functionality generic? The server side does the exact
     % same stuff.
     Datagram = "messages in " ++ Channel,
-    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), Datagram, false),
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), Datagram, hold),
     {value, Connection, OtherConnections} = lists:keytake({IP, Port},
                                                           #server_connection.address,
                                                           State#cs.servers),
@@ -252,7 +253,7 @@ send_message(State, IP, Port, Channel, none, Str) ->
 send_message(State, IP, Port, _Channel, StreamID, Str) ->
     % The address and stream already uniquely identify our username and the
     % channel.
-    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID, Str, false),
+    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID, Str, hold),
     State.
 
 reply_login(State, IP, Port, Str, StreamID) ->
@@ -270,10 +271,11 @@ reply_login(State, IP, Port, Str, StreamID) ->
     end.
 
 reply_login2(State, IP, Port, Username, none) ->
-    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "username: " ++ Username, true),
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "username: " ++ Username, yield),
     reply_login3(State, IP, Port, Username, StreamID);
 reply_login2(State, IP, Port, Username, StreamID) ->
-    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID, "username: " ++ Username, true),
+    {ok, _} = msp:append_stream(State#cs.msp_proc, IP, Port, StreamID,
+                                "username: " ++ Username, yield),
     reply_login3(State, IP, Port, Username, StreamID).
 
 reply_login3(State, IP, Port, Username, StreamID) ->
@@ -331,7 +333,7 @@ connect(State, Host, Port) ->
 
 join(State = #cs{servers = [Connection]}, Channel) ->
     {IP, Port} = Connection#server_connection.address,
-    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "join " ++ Channel, true),
+    {ok, StreamID} = msp:open_stream(State#cs.msp_proc, IP, Port, self(), "join " ++ Channel, yield),
     io:format("Attempting to join...~n", []),
     NewPendingCommands = maps:put(StreamID, {join, Channel},
                                   Connection#server_connection.pending_commands),

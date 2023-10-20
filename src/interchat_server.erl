@@ -69,7 +69,7 @@ handle_new_stream(State, IP, Port, StreamID, Yield, Data) ->
                       [inet:ntoa(IP), Port, Data])
     end.
 
-handle_new_stream2(State, IP, Port, StreamID, true, "username: " ++ Username, Connection) ->
+handle_new_stream2(State, IP, Port, StreamID, yield, "username: " ++ Username, Connection) ->
     case Connection#connection.username of
         {not_chosen, no_stream} ->
             NewConnection = Connection#connection{username = {not_chosen, StreamID}},
@@ -82,9 +82,9 @@ handle_new_stream2(State, IP, Port, StreamID, true, "username: " ++ Username, Co
             % they already chose a username! TODO: Reject the stream.
             State
     end;
-handle_new_stream2(State, IP, Port, StreamID, true, "join " ++ ChannelName, Connection) ->
+handle_new_stream2(State, IP, Port, StreamID, yield, "join " ++ ChannelName, Connection) ->
     join_channel(State, IP, Port, StreamID, ChannelName, Connection);
-handle_new_stream2(State, IP, Port, StreamID, false, "messages in " ++ ChannelName, Connection) ->
+handle_new_stream2(State, IP, Port, StreamID, hold, "messages in " ++ ChannelName, Connection) ->
     add_message_upload_stream(State, IP, Port, StreamID, ChannelName, Connection);
 handle_new_stream2(State, IP, Port, StreamID, Yield, Datagram, _Connection) ->
     % TODO: Reject the stream.
@@ -131,7 +131,7 @@ handle_new_packet(State, IP, Port, StreamID, Index, Yield, Datagram) ->
             State
     end.
 
-handle_new_packet2(State, IP, Port, StreamID, _, true, "username: " ++ Username, #connection{username = {not_chosen, StreamID}}) ->
+handle_new_packet2(State, IP, Port, StreamID, _, yield, "username: " ++ Username, #connection{username = {not_chosen, StreamID}}) ->
     check_username_chosen(State, IP, Port, StreamID, Username);
 handle_new_packet2(State, IP, Port, StreamID, PacketID, Yield, Datagram, Connection) ->
     case maps:find(StreamID, Connection#connection.streams_in) of
@@ -146,8 +146,9 @@ handle_new_packet2(State, IP, Port, StreamID, PacketID, Yield, Datagram, Connect
 log_datagram(IP, Port, StreamID, PacketID, Yield, Datagram) ->
     % TODO: Reject the stream.
     YieldStr = case Yield of
-                   true  -> "(yield)";
-                   false -> "(...)"
+                   yield  -> "(yield)";
+                   hold -> "(...)";
+                   close -> "(close)"
                end,
     io:format("~s:~w sent unexpected packet ~p.~p: ~s ~s~n",
               [inet:ntoa(IP), Port, StreamID, PacketID, Datagram, YieldStr]).
@@ -157,12 +158,12 @@ check_username_chosen(State, IP, Port, StreamID, Username) ->
     Connections = State#ss.connections,
     case lists:keymember(Username, #connection.username, Connections) of
         true ->
-            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "taken", true),
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "taken", yield),
             State;
         false ->
             % TODO: close stream?
             io:format("~s:~w chose username ~s.~n", [inet:ntoa(IP), Port, Username]),
-            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "accepted", true),
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "accepted", close),
             Connection = #connection{address = {IP, Port},
                                      username = Username},
             NewConnections = lists:keystore({IP, Port}, #connection.address,
@@ -179,7 +180,8 @@ join_channel(State, IP, Port, StreamID, ChannelName, #connection{username = User
     case lists:member(Username, Channel#channel.users) of
         true ->
             %TODO: Add a third yield mode, to close the stream.
-            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "already joined", true),
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID,
+                                        "already joined", close),
             State;
         false ->
             io:format("User ~s joined channel ~s.~n", [Username, ChannelName]),
@@ -188,7 +190,8 @@ join_channel(State, IP, Port, StreamID, ChannelName, #connection{username = User
             Users = [Username | UsersWithout],
             NewChannel = Channel#channel{users = Users},
 
-            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID, "successfully joined", true),
+            {ok, _} = msp:append_stream(State#ss.msp_proc, IP, Port, StreamID,
+                                        "successfully joined", close),
 
             NewMessage = #message{sender = server,
                                   remaining_users = UsersWithout,
@@ -281,14 +284,14 @@ try_send_message_each_connection(MSP, Datagram, ChannelName, Connection) ->
     case maps:find(ChannelName, Connection#connection.streams_out) of
         {ok, StreamID} ->
             {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
-                                        false),
+                                        hold),
             Connection;
         error ->
             {ok, StreamID} = msp:open_stream(MSP, IP, Port, self(),
                                              "messages in " ++ ChannelName,
-                                             false),
+                                             hold),
             {ok, _} = msp:append_stream(MSP, IP, Port, StreamID, Datagram,
-                                        false),
+                                        hold),
             NewStreams = maps:put(ChannelName, StreamID,
                                   Connection#connection.streams_out),
             Connection#connection{streams_out = NewStreams}
