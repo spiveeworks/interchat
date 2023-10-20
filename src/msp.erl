@@ -49,7 +49,11 @@ trust_stream(PID, IP, Port, StreamID) ->
                      next_unverified_index :: integer(),
                      % How many packets have we received overall?
                      next_index :: integer(),
-                     mode :: us | them | closed,
+                     % If the stream didn't really start at datagram 0, how do
+                     % we work out the user-facing stream index?
+                     offset = 0 :: integer(),
+                     has_control :: boolean(),
+                     is_open :: boolean(),
                      event_listener :: pid(),
                      trusted = false :: boolean()}).
 -record(msp_peer, {streams = #{} :: #{integer() => #msp_stream{}},
@@ -274,14 +278,9 @@ do_open_stream(State, IP, Port, HandlerPID, FirstPayload, FirstYield, Caller) ->
             % TODO: If we have to concede streams then this id might not turn
             % out to be correct. Should we use even/odd stream IDs just to make
             % all this stuff simple?
-            StreamID = choose_stream_id(Peer),
+            {StreamID, Stream} = reopen_stream(Peer, HandlerPID),
             gen_server:reply(Caller, {ok, StreamID}),
 
-            Stream = #msp_stream{next_ack_index = 0,
-                                 next_unverified_index = 0,
-                                 next_index = 0,
-                                 mode = us,
-                                 event_listener = HandlerPID},
             % Skip all of the guards of `append_stream`, since we already
             % passed or constructed the cases ourselves, just send the datagram
             % and rebuild.
@@ -291,18 +290,47 @@ do_open_stream(State, IP, Port, HandlerPID, FirstPayload, FirstYield, Caller) ->
             gen_server:reply(Caller, {error, not_connected})
     end.
 
-choose_stream_id(#msp_peer{streams = Streams, id_pattern = even}) ->
-    choose_stream_id(Streams, 0);
-choose_stream_id(#msp_peer{streams = Streams, id_pattern = odd}) ->
-    choose_stream_id(Streams, 1).
+reopen_stream(#msp_peer{streams = Streams, id_pattern = even}, HandlerPID) ->
+    reopen_stream(Streams, HandlerPID, 0);
+reopen_stream(#msp_peer{streams = Streams, id_pattern = odd}, HandlerPID) ->
+    reopen_stream(Streams, HandlerPID, 1).
 
-choose_stream_id(Streams, Attempt) ->
-    case maps:is_key(Attempt, Streams) of
-        true ->
-            choose_stream_id(Streams, Attempt + 2);
-        false ->
-            Attempt
+reopen_stream(Streams, HandlerPID, Attempt) ->
+    case try_open_stream(Streams, HandlerPID, Attempt) of
+        taken ->
+            reopen_stream(Streams, HandlerPID, Attempt + 2);
+        {ok, Stream} ->
+            {Attempt, Stream}
     end.
+
+try_open_stream(Streams, HandlerPID, ID) ->
+    case maps:find(ID, Streams) of
+        {ok, Stream = #msp_stream{is_open = false}} ->
+            % Make sure to keep .data, since the close message might not have
+            % delivered yet, if it came from us.
+            % offset should already be set at the point where we sent/received
+            % the datagram.
+            NewStream = Stream#msp_stream{offset = -Stream#msp_stream.next_index,
+                                          has_control = true,
+                                          is_open = true,
+                                          event_listener = HandlerPID},
+            {ok, NewStream};
+        {ok, _} ->
+            taken;
+        error ->
+            Stream = #msp_stream{next_ack_index = 0,
+                                 next_unverified_index = 0,
+                                 next_index = 0,
+                                 has_control = true,
+                                 is_open = true,
+                                 event_listener = HandlerPID},
+            {ok, Stream}
+    end.
+
+is_stream_opened_by_us(#msp_peer{id_pattern = even}, StreamID) ->
+    StreamID rem 2 == 0;
+is_stream_opened_by_us(#msp_peer{id_pattern = odd}, StreamID) ->
+    StreamID rem 2 /= 0.
 
 do_append_stream(State, IP, Port, StreamID, Payload, Yield, Caller) ->
     case maps:find({IP, Port}, State#msp_state.peers) of
@@ -324,14 +352,14 @@ do_append_stream2(State, IP, Port, StreamID, Payload, Yield, Caller, Peer) ->
             State
     end.
 
-do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{mode = them}) ->
+do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{has_control = false}) ->
     gen_server:reply(Caller, {error, not_our_turn}),
     State;
-do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{mode = closed}) ->
+do_append_stream3(State, _, _, _, _, _, Caller, _, #msp_stream{is_open = false}) ->
     gen_server:reply(Caller, {error, stream_closed}),
     State;
 do_append_stream3(State, IP, Port, StreamID, Payload, Yield, Caller, Peer, Stream) ->
-    Index = Stream#msp_stream.next_index,
+    Index = Stream#msp_stream.next_index + Stream#msp_stream.offset,
     gen_server:reply(Caller, {ok, Index}),
 
     build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream).
@@ -346,11 +374,15 @@ build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
 
     % Add the tracking info for this new stream.
     Data = [Datagram | Stream#msp_stream.data],
-    NewMode = case Yield of
-                  yield -> them;
-                  hold -> us;
-                  close -> closed
-              end,
+    HasControl = case Yield of
+                     yield -> false;
+                     hold -> true;
+                     close -> is_stream_opened_by_us(Peer, StreamID)
+                 end,
+    Offset = case Yield of
+                 close -> -(Index + 1);
+                 _     -> Stream#msp_stream.offset
+             end,
     NewStream = Stream#msp_stream{data = Data,
                                   next_index = Index + 1,
                                   % Also treat previous packets as verified and
@@ -360,7 +392,10 @@ build_send_datagram(State, IP, Port, StreamID, Payload, Yield, Peer, Stream) ->
                                   % acknowledge them.
                                   next_ack_index = Index + 1,
                                   next_unverified_index = Index + 1,
-                                  mode = NewMode},
+                                  % Set the offset if we just closed the stream
+                                  offset = Offset,
+                                  has_control = HasControl,
+                                  is_open = Yield /= closed},
     rebuild_state(State, IP, Port, Peer, StreamID, NewStream).
 
 send_datagram(State, IP, Port, StreamID, DatagramInfo) ->
@@ -420,8 +455,8 @@ do_handle_datagram2(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
 
 do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Payload) ->
     Next = Stream#msp_stream.next_index,
-    case Stream#msp_stream.mode of
-        them when Index >= Next ->
+    case Stream#msp_stream.has_control of
+        false when Index >= Next ->
             case lists:keymember(Index, #msp_datagram.index, Stream#msp_stream.data) of
                 false ->
                     % the fact that we got a reply means anything we sent was also
@@ -435,7 +470,7 @@ do_handle_datagram3(State, IP, Port, Peer, StreamID, Stream, Index, Yield, Paylo
                                              payload = Payload},
                     Data = [Datagram | NewStream#msp_stream.data],
                     NewStream2 = NewStream#msp_stream{data = Data},
-                    NewStream3 = send_incoming_packets(IP, Port, StreamID, NewStream2),
+                    NewStream3 = send_incoming_packets(IP, Port, Peer, StreamID, NewStream2),
 
                     % If the stream is trusted, then we might be able to ACK
                     % right now.
@@ -462,13 +497,9 @@ f() ->
 -endif.
 
 do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) ->
-    Actual = StreamID rem 2 == 0,
-    % If our streams have to be odd, then we expect their streams to be even,
-    % so we expect StreamID rem 2 to be 0.
-    Expected = Peer#msp_peer.id_pattern == odd,
-    % Check whether their stream is even to whether we expected it to be even.
-    case Actual == Expected of
-        true ->
+    % Check whether they should even be opening this stream.
+    case is_stream_opened_by_us(Peer, StreamID) of
+        false ->
             StreamListener = Peer#msp_peer.stream_open_listener,
             Datagram = #msp_datagram{index = Index,
                                      direction = in,
@@ -480,43 +511,47 @@ do_handle_new_datagram(State, IP, Port, Peer, StreamID, Index, Yield, Payload) -
                                  next_ack_index = 0,
                                  next_unverified_index = 0,
                                  next_index = 0,
-                                 mode = them,
+                                 has_control = false,
+                                 is_open = true,
                                  event_listener = StreamListener},
-            Stream2 = send_incoming_packets(IP, Port, StreamID, Stream),
+            Stream2 = send_incoming_packets(IP, Port, Peer, StreamID, Stream),
 
             rebuild_state(State, IP, Port, Peer, StreamID, Stream2);
-        false ->
-            % TODO: Reject the stream.
+        true ->
+            % They sent us a datagram on a channel we are responsible for
+            % opening. TODO: Reject the stream.
             State
     end.
 
-send_incoming_packets(_IP, _Port, _StreamID, Stream = #msp_stream{mode = Mode}) when Mode /= them ->
+send_incoming_packets(_IP, _Port, _Peer, _StreamID, Stream = #msp_stream{has_control = true}) ->
     % TODO: check that the data buffer is completely empty? since we only just
     % told the user about some packets, and the peer just yielded, so they
     % shouldn't have sent more packets after.
     Stream;
-send_incoming_packets(IP, Port, StreamID, Stream) ->
+send_incoming_packets(IP, Port, Peer, StreamID, Stream) ->
     Index = Stream#msp_stream.next_index,
     case lists:keytake(Index, #msp_datagram.index, Stream#msp_stream.data) of
         {value, Datagram, Data} ->
             Yield = Datagram#msp_datagram.mode,
             Payload = Datagram#msp_datagram.payload,
+            AppIndex = Index + Stream#msp_stream.offset,
             erlang:send(Stream#msp_stream.event_listener,
-                        {msp_datagram, IP, Port, StreamID, Index, Yield, Payload}),
+                        {msp_datagram, IP, Port, StreamID, AppIndex, Yield, Payload}),
             NextUnverified = case Stream#msp_stream.trusted of
                                  true  -> Index + 1;
                                  false -> Stream#msp_stream.next_unverified_index
                              end,
-            NewMode = case Yield of
-                          yield -> us;
-                          hold -> them;
-                          close -> closed
-                      end,
+            HasControl = case Yield of
+                             yield -> true;
+                             hold -> false;
+                             close -> is_stream_opened_by_us(Peer, StreamID)
+                         end,
             NewStream = Stream#msp_stream{data = Data,
                                           next_index = Index + 1,
                                           next_unverified_index = NextUnverified,
-                                          mode = NewMode},
-            send_incoming_packets(IP, Port, StreamID, NewStream);
+                                          has_control = HasControl,
+                                          is_open = Yield /= close},
+            send_incoming_packets(IP, Port, Peer, StreamID, NewStream);
         false ->
             Stream
     end.
